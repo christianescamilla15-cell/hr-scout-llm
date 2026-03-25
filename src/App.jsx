@@ -515,6 +515,251 @@ function analyzeCV(cvText, jobDescription) {
   };
 }
 
+// ─── AGENTIC SCORING PIPELINE (LOCAL) ──────────────────────────────────────
+
+// Agent 1: Skill Extractor
+function extractSkills(text) {
+  const categories = {
+    programming: { keywords: ['python','javascript','java','c++','c#','ruby','go','rust','php','swift','kotlin','typescript','sql','html','css','react','vue','angular','node','django','flask','fastapi','laravel','spring'], found: [] },
+    ai_ml: { keywords: ['machine learning','deep learning','nlp','natural language','computer vision','tensorflow','pytorch','keras','scikit','pandas','numpy','llm','gpt','claude','ai','artificial intelligence','neural network','rlhf','prompt engineering','rag','langchain','embeddings','vector'], found: [] },
+    cloud: { keywords: ['aws','azure','gcp','docker','kubernetes','lambda','s3','ec2','terraform','ci/cd','github actions','jenkins','vercel','render','heroku'], found: [] },
+    databases: { keywords: ['sql','postgresql','mysql','mongodb','redis','firebase','supabase','dynamodb','sqlite','elasticsearch'], found: [] },
+    soft_skills: { keywords: ['leadership','communication','teamwork','problem solving','agile','scrum','management','mentoring','liderazgo','comunicación','trabajo en equipo','gestión'], found: [] },
+  };
+
+  const lower = text.toLowerCase();
+  for (const [cat, config] of Object.entries(categories)) {
+    config.found = config.keywords.filter(k => lower.includes(k));
+  }
+
+  return categories;
+}
+
+// Agent 2: Experience Evaluator
+function agentEvaluateExperience(cvText) {
+  const lower = cvText.toLowerCase();
+
+  // Detect years of experience
+  const yearPatterns = [
+    /(\d+)\+?\s*(?:years?|años?|anos?)\s*(?:of\s*)?(?:experience|experiencia)/gi,
+    /(?:experience|experiencia)\s*(?:of\s*)?(\d+)\+?\s*(?:years?|años?|anos?)/gi,
+    /(\d{4})\s*[-–]\s*(?:present|actual|current|(\d{4}))/gi,
+  ];
+
+  let maxYears = 0;
+  yearPatterns.forEach(p => {
+    const matches = [...cvText.matchAll(p)];
+    matches.forEach(m => {
+      const years = parseInt(m[1]);
+      if (years > maxYears && years < 50) maxYears = years;
+    });
+  });
+
+  // Detect seniority level
+  const seniorPatterns = ['senior','lead','principal','architect','director','manager','head','chief','staff'];
+  const midPatterns = ['mid','intermediate','regular','developer','engineer','analyst'];
+  const juniorPatterns = ['junior','intern','trainee','entry','beginner','student','graduate'];
+
+  const seniorScore = seniorPatterns.filter(p => lower.includes(p)).length;
+  const midScore = midPatterns.filter(p => lower.includes(p)).length;
+  const juniorScore = juniorPatterns.filter(p => lower.includes(p)).length;
+
+  let level = 'mid';
+  if (seniorScore > midScore && seniorScore > juniorScore) level = 'senior';
+  else if (juniorScore > midScore) level = 'junior';
+
+  // Detect education
+  const degrees = [];
+  const degreePatterns = [
+    /(?:bachelor|licenciatura|ingenier[ií]a|B\.?S\.?|B\.?A\.?)/gi,
+    /(?:master|maestr[ií]a|M\.?S\.?|M\.?A\.?|MBA)/gi,
+    /(?:phd|doctorado|ph\.?d\.?)/gi,
+  ];
+  degreePatterns.forEach((p, i) => {
+    if (p.test(cvText)) degrees.push(['bachelor','master','phd'][i]);
+  });
+
+  return { maxYears, level, degrees, projectCount: (cvText.match(/(?:project|proyecto|built|developed|created|construí|desarrollé|desplegad|implementa|implemente|diseno|lidere)/gi) || []).length };
+}
+
+// Agent 3: Job Fit Analyzer
+function analyzeJobFit(jobSkills, cvSkills, jobText, cvText) {
+  const fit = { matched: [], missing: [], bonus: [], score: 0 };
+
+  const jobLower = jobText.toLowerCase();
+
+  // Split into required vs desirable
+  const reqSection = jobLower.split(/(?:deseable|nice to have|bonus|plus|desirable)/i);
+  const reqText = reqSection[0] || jobLower;
+
+  // Check each category
+  for (const [cat, config] of Object.entries(jobSkills)) {
+    config.found.forEach(skill => {
+      const inCV = cvSkills[cat]?.found.includes(skill);
+      if (inCV) {
+        fit.matched.push({ skill, category: cat, required: reqText.includes(skill) });
+      } else if (reqText.includes(skill)) {
+        fit.missing.push({ skill, category: cat });
+      }
+    });
+  }
+
+  // Check for bonus skills in CV not in job
+  for (const [cat, config] of Object.entries(cvSkills)) {
+    config.found.forEach(skill => {
+      if (!jobSkills[cat]?.found.includes(skill)) {
+        fit.bonus.push({ skill, category: cat });
+      }
+    });
+  }
+
+  // Calculate score
+  const totalRequired = fit.matched.filter(m => m.required).length + fit.missing.length;
+  const matchedRequired = fit.matched.filter(m => m.required).length;
+  const requiredScore = totalRequired > 0 ? (matchedRequired / totalRequired) * 70 : 35;
+  const bonusScore = Math.min(fit.bonus.length * 3, 15);
+  const matchedDesirableScore = Math.min(fit.matched.filter(m => !m.required).length * 5, 15);
+
+  fit.score = Math.round(Math.min(100, requiredScore + bonusScore + matchedDesirableScore));
+
+  return fit;
+}
+
+// Agent 4: Recommendation Engine
+function generateRecommendation(fit, experience, lang) {
+  const { score, matched, missing, bonus } = fit;
+  const { level, maxYears } = experience;
+
+  let verdict, nextStep, interviewQ;
+
+  if (lang === 'es') {
+    if (score >= 80) {
+      verdict = `Candidato fuerte (${score}/100). ${matched.length} habilidades clave coinciden${bonus.length > 0 ? `, mas ${bonus.length} habilidades adicionales` : ''}.`;
+      nextStep = 'Agendar entrevista tecnica prioritaria.';
+      interviewQ = missing.length > 0
+        ? `Como compensarias tu falta de experiencia en ${missing[0]?.skill}?`
+        : `Describe tu proyecto mas complejo usando ${matched[0]?.skill}.`;
+    } else if (score >= 50) {
+      verdict = `Candidato parcial (${score}/100). Cumple ${matched.length} requisitos pero faltan ${missing.length} habilidades clave.`;
+      nextStep = 'Evaluar si las habilidades faltantes son entrenables.';
+      interviewQ = `Tienes experiencia indirecta con ${missing.slice(0,2).map(m=>m.skill).join(' o ')}?`;
+    } else {
+      verdict = `No recomendado (${score}/100). Solo cumple ${matched.length} de los requisitos.`;
+      nextStep = 'Considerar para otros roles o posiciones junior.';
+      interviewQ = `Que te motiva a aplicar a este puesto sin experiencia en ${missing.slice(0,2).map(m=>m.skill).join(', ')}?`;
+    }
+  } else {
+    if (score >= 80) {
+      verdict = `Strong candidate (${score}/100). ${matched.length} key skills matched${bonus.length > 0 ? `, plus ${bonus.length} additional skills` : ''}.`;
+      nextStep = 'Schedule priority technical interview.';
+      interviewQ = missing.length > 0
+        ? `How would you compensate for your lack of experience in ${missing[0]?.skill}?`
+        : `Describe your most complex project using ${matched[0]?.skill}.`;
+    } else if (score >= 50) {
+      verdict = `Partial match (${score}/100). Meets ${matched.length} requirements but missing ${missing.length} key skills.`;
+      nextStep = 'Evaluate if missing skills are trainable.';
+      interviewQ = `Do you have indirect experience with ${missing.slice(0,2).map(m=>m.skill).join(' or ')}?`;
+    } else {
+      verdict = `Not recommended (${score}/100). Only meets ${matched.length} requirements.`;
+      nextStep = 'Consider for other roles or junior positions.';
+      interviewQ = `What motivates you to apply without experience in ${missing.slice(0,2).map(m=>m.skill).join(', ')}?`;
+    }
+  }
+
+  // Experience bonus annotation
+  if (level === 'senior' && maxYears >= 5 && score >= 50) {
+    verdict += lang === 'es' ? ` Nivel senior con ${maxYears}+ anos.` : ` Senior level with ${maxYears}+ years.`;
+  }
+
+  return { verdict, nextStep, interviewQuestion: interviewQ, strengths: matched.map(m => m.skill), gaps: missing.map(m => m.skill) };
+}
+
+// Orchestrator: runs the 4-agent pipeline and returns UI-compatible shape
+function agenticAnalyze(jobDesc, cvText, candidateName, lang) {
+  const jobSkills = extractSkills(jobDesc);
+  const cvSkills = extractSkills(cvText);
+  const experience = agentEvaluateExperience(cvText);
+  const fit = analyzeJobFit(jobSkills, cvSkills, jobDesc, cvText);
+  const recommendation = generateRecommendation(fit, experience, lang);
+
+  // Experience bonus to score
+  let finalScore = fit.score;
+  if (experience.maxYears >= 5) finalScore = Math.min(100, finalScore + 5);
+  if (experience.maxYears >= 3) finalScore = Math.min(100, finalScore + 3);
+  if (experience.degrees.includes('master') || experience.degrees.includes('phd')) finalScore = Math.min(100, finalScore + 4);
+  finalScore = Math.max(5, Math.min(98, finalScore));
+
+  // Extract title from first line of CV
+  const firstLine = cvText.split("\n")[0] || "";
+  const titulo = (firstLine.split("|")[0] || firstLine).trim();
+  const displayTitle = titulo.length > 45 ? titulo.substring(0, 42) + "..." : titulo;
+
+  // Map strengths to display names
+  const habilidades = recommendation.strengths
+    .map(s => SKILLS_DISPLAY[s] || s.charAt(0).toUpperCase() + s.slice(1))
+    .filter((v, i, arr) => arr.indexOf(v) === i)
+    .slice(0, 5);
+  if (habilidades.length === 0) habilidades.push("Generales");
+
+  // Build fortalezas (strengths) in Spanish for UI
+  const fortalezas = [];
+  if (recommendation.strengths.length > 0) {
+    fortalezas.push(`${recommendation.strengths.length} habilidades clave coinciden con el puesto: ${habilidades.slice(0, 3).join(', ')}`);
+  }
+  if (experience.maxYears > 0) {
+    fortalezas.push(`${experience.maxYears} anos de experiencia detectados, nivel ${experience.level}`);
+  }
+  if (experience.degrees.length > 0) {
+    fortalezas.push(`Formacion academica: ${experience.degrees.join(', ')}`);
+  }
+  if (experience.projectCount > 0) {
+    fortalezas.push(`${experience.projectCount} proyectos/logros mencionados en el CV`);
+  }
+  if (fit.bonus.length > 0) {
+    fortalezas.push(`${fit.bonus.length} habilidades adicionales relevantes fuera del requerimiento`);
+  }
+  if (fortalezas.length < 2) {
+    fortalezas.push("Perfil con potencial de desarrollo en el area requerida");
+  }
+
+  // Build brechas (gaps)
+  const brechas = [];
+  for (const gap of recommendation.gaps.slice(0, 3)) {
+    const display = SKILLS_DISPLAY[gap] || gap.charAt(0).toUpperCase() + gap.slice(1);
+    brechas.push(`Falta competencia requerida: ${display}`);
+  }
+  if (experience.maxYears === 0) {
+    brechas.push("No se detecta experiencia profesional especifica");
+  }
+  if (brechas.length === 0) {
+    brechas.push("Podria requerir onboarding en procesos internos especificos");
+  }
+
+  // Pipeline trace for UI
+  const pipeline = [
+    { agent: 'Skill Extractor', skills: Object.entries(cvSkills).map(([k,v]) => `${k}: ${v.found.length}`).join(', ') },
+    { agent: 'Experience Evaluator', level: experience.level, years: experience.maxYears },
+    { agent: 'Job Fit Analyzer', matched: fit.matched.length, missing: fit.missing.length, bonus: fit.bonus.length },
+    { agent: 'Recommendation Engine', score: finalScore },
+  ];
+
+  return {
+    score: finalScore,
+    titulo: displayTitle,
+    experiencia_anos: experience.maxYears,
+    habilidades_clave: habilidades,
+    fortalezas: fortalezas.slice(0, 4),
+    brechas: brechas.slice(0, 3),
+    veredicto: recommendation.verdict,
+    siguiente_paso: recommendation.nextStep,
+    pregunta_entrevista: recommendation.interviewQuestion,
+    matched_keywords: recommendation.strengths,
+    unmatched_keywords: recommendation.gaps,
+    analysisMode: 'agentic',
+    pipeline,
+  };
+}
+
 // ─── CLAUDE API ANALYSIS ──────────────────────────────────────────────────
 async function analyzeCVWithClaude(cvText, jobDescription, localResult, apiKey) {
   if (!apiKey) return { ...localResult, analysisMode: "local" };
@@ -990,6 +1235,8 @@ const TRANSLATIONS = {
     range80_100: "80-100",
     toolUseMode: "Tool Use",
     toolCalls: "llamadas",
+    agenticMode: "Agentic",
+    pipelineTitle: "Pipeline de Analisis",
   },
   en: {
     subtitle: "AI-powered CV screening \u00b7 Real competency analysis \u00b7 Automated HR",
@@ -1094,6 +1341,8 @@ const TRANSLATIONS = {
     range80_100: "80-100",
     toolUseMode: "Tool Use",
     toolCalls: "calls",
+    agenticMode: "Agentic",
+    pipelineTitle: "Analysis Pipeline",
   },
 };
 
@@ -1375,8 +1624,8 @@ function TourOverlay({ tourStep, tourActive, lang, setLang, onNext, onSkip, tota
 function ScoreBadge({ score, t, analysisMode }) {
   const color = score >= 80 ? "#10B981" : score >= 60 ? "#F59E0B" : "#EF4444";
   const label = score >= 80 ? t.scoreSuitable : score >= 60 ? t.scoreReview : t.scoreNotSuitable;
-  const modeColor = analysisMode === "tool_use" ? "#34D399" : analysisMode === "ai" ? "#818CF8" : "rgba(255,255,255,0.3)";
-  const modeLabel = analysisMode === "tool_use" ? (t.toolUseMode || "Tool Use") : analysisMode === "ai" ? t.aiMode : t.localMode;
+  const modeColor = analysisMode === "tool_use" ? "#34D399" : analysisMode === "ai" ? "#818CF8" : analysisMode === "agentic" ? "#F59E0B" : "rgba(255,255,255,0.3)";
+  const modeLabel = analysisMode === "tool_use" ? (t.toolUseMode || "Tool Use") : analysisMode === "ai" ? t.aiMode : analysisMode === "agentic" ? (t.agenticMode || "Agentic") : t.localMode;
   return (
     <div style={{ textAlign: "center" }}>
       <div style={{
@@ -1394,7 +1643,7 @@ function ScoreBadge({ score, t, analysisMode }) {
           <span style={{
             position: "absolute", top: -6, right: -6,
             fontSize: 7, padding: "1px 4px", borderRadius: 3,
-            background: analysisMode === "tool_use" ? "rgba(52,211,153,0.25)" : analysisMode === "ai" ? "rgba(99,102,241,0.25)" : "rgba(255,255,255,0.08)",
+            background: analysisMode === "tool_use" ? "rgba(52,211,153,0.25)" : analysisMode === "ai" ? "rgba(99,102,241,0.25)" : analysisMode === "agentic" ? "rgba(245,158,11,0.25)" : "rgba(255,255,255,0.08)",
             border: `1px solid ${modeColor}`,
             color: modeColor, fontWeight: 700,
             fontFamily: "'DM Mono', monospace",
@@ -1591,7 +1840,31 @@ function CandidateCard({ candidate, rank, onAnalyze, analyzing, result, globalAn
             </div>
           )}
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginTop: (result.analysisMode === "ai" || result.analysisMode === "tool_use") ? 4 : 14 }}>
+          {/* Agentic Pipeline Trace */}
+          {result.analysisMode === "agentic" && result.pipeline && (
+            <div style={{ display: "flex", gap: 6, marginTop: 14, marginBottom: 4, flexWrap: "wrap", alignItems: "center" }}>
+              <span style={{ fontSize: 9, fontWeight: 700, color: "#F59E0B", fontFamily: "'DM Mono', monospace", letterSpacing: "0.08em", textTransform: "uppercase", marginRight: 4 }}>
+                {t.pipelineTitle || "Pipeline"}:
+              </span>
+              {result.pipeline.map((step, i) => (
+                <span key={i} style={{
+                  fontSize: 9, padding: "3px 8px", borderRadius: 4,
+                  background: "rgba(245,158,11,0.08)",
+                  border: "1px solid rgba(245,158,11,0.2)",
+                  color: "#FCD34D", fontFamily: "'DM Mono', monospace",
+                  display: "inline-flex", alignItems: "center", gap: 4,
+                }}>
+                  <span style={{ fontWeight: 700 }}>{step.agent}</span>
+                  <span style={{ color: "rgba(255,255,255,0.35)" }}>
+                    {step.skills ? step.skills : step.level ? `${step.level} / ${step.years}y` : step.matched !== undefined ? `${step.matched}ok ${step.missing}gap ${step.bonus}+` : `${step.score}pts`}
+                  </span>
+                  {i < result.pipeline.length - 1 && <span style={{ color: "rgba(245,158,11,0.4)", marginLeft: 2 }}>&rarr;</span>}
+                </span>
+              ))}
+            </div>
+          )}
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginTop: (result.analysisMode === "ai" || result.analysisMode === "tool_use" || result.analysisMode === "agentic") ? 4 : 14 }}>
             {/* Fortalezas */}
             <div style={{ background: "rgba(16,185,129,0.06)", border: "1px solid rgba(16,185,129,0.15)", borderRadius: 8, padding: 12 }}>
               <p style={{ margin: "0 0 8px", fontSize: 10, fontWeight: 700, color: "#10B981", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>&#10003; {t.strengths}</p>
@@ -2170,9 +2443,9 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
       ref.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
 
-    const localResult = analyzeCV(candidate.cv, jobDesc);
+    const localResult = agenticAnalyze(jobDesc, candidate.cv, candidate.name, lang);
 
-    // Try tool use first (agentic), fall back to simple Claude, then local
+    // Try tool use first (Claude agentic), fall back to simple Claude, then local agentic
     let parsed = await analyzeWithToolUse(candidate.cv, jobDesc, localResult, apiKey);
     if (!parsed) {
       parsed = await analyzeCVWithClaude(candidate.cv, jobDesc, localResult, apiKey);
@@ -2184,7 +2457,7 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
       return updated;
     });
     setAnalyzingId(null);
-  }, [analyzingId, candidates, jobDesc, updateRankings, apiKey]);
+  }, [analyzingId, candidates, jobDesc, updateRankings, apiKey, lang]);
 
   const analyzeAll = async () => {
     if (!isJobDescValid) return;
@@ -2201,7 +2474,7 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
         ref.scrollIntoView({ behavior: "smooth", block: "nearest" });
       }
 
-      const localResult = analyzeCV(c.cv, jobDesc);
+      const localResult = agenticAnalyze(jobDesc, c.cv, c.name, lang);
       let parsed = await analyzeWithToolUse(c.cv, jobDesc, localResult, apiKey);
       if (!parsed) {
         parsed = await analyzeCVWithClaude(c.cv, jobDesc, localResult, apiKey);
@@ -2283,8 +2556,8 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
           setAnalyzingId(c.id);
           const ref = cardRefs.current[c.id];
           if (ref) ref.scrollIntoView({ behavior: "smooth", block: "nearest" });
-          const localResult = analyzeCV(c.cv, currentJobDesc);
-          allRes[c.id] = { ...localResult, analysisMode: "local" };
+          const localResult = agenticAnalyze(currentJobDesc, c.cv, c.name, lang);
+          allRes[c.id] = localResult;
           setResults(prev => {
             const updated = { ...prev, [c.id]: allRes[c.id] };
             updateRankings(updated, candidates);
