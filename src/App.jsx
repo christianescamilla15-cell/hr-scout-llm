@@ -515,6 +515,319 @@ function analyzeCV(cvText, jobDescription) {
   };
 }
 
+// ─── CLAUDE API ANALYSIS ──────────────────────────────────────────────────
+async function analyzeCVWithClaude(cvText, jobDescription, localResult, apiKey) {
+  if (!apiKey) return { ...localResult, analysisMode: "local" };
+
+  try {
+    const startTime = Date.now();
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 800,
+        system: "You are an expert HR analyst. Analyze this candidate's CV against the job requirements. Respond in JSON only, no markdown: {\"strengths\":[\"s1\",\"s2\",\"s3\"],\"gaps\":[\"g1\",\"g2\",\"g3\"],\"verdict\":\"2 line summary\",\"action\":\"interview|waitlist|discard\",\"question\":\"specific interview question\",\"aiScore\":0-100}",
+        messages: [{ role: "user", content: `Job:\n${jobDescription}\n\nCandidate CV:\n${cvText}\n\nLocal keyword score: ${localResult.score}/100` }],
+      }),
+    });
+
+    if (!response.ok) {
+      console.warn("Claude API error:", response.status);
+      return { ...localResult, analysisMode: "local" };
+    }
+
+    const data = await response.json();
+    const text = data.content?.[0]?.text || "";
+    const aiData = JSON.parse(text);
+    const elapsed = Date.now() - startTime;
+
+    const aiScore = Math.max(0, Math.min(100, Number(aiData.aiScore) || localResult.score));
+    const finalScore = Math.round(localResult.score * 0.4 + aiScore * 0.6);
+    const scoreDiff = Math.abs(localResult.score - aiScore);
+    const confidence = scoreDiff <= 10 ? "high" : scoreDiff <= 25 ? "medium" : "low";
+
+    // Map action to Spanish
+    const actionMap = {
+      interview: "Agendar entrevista tecnica en los proximos 3 dias. Candidato prioritario.",
+      waitlist: "Anadir a lista de espera. Evaluar si las brechas son capacitables en 1-2 meses.",
+      discard: "Descartar para este puesto. Considerar para roles alternativos si aplica.",
+    };
+
+    return {
+      ...localResult,
+      score: finalScore,
+      localScore: localResult.score,
+      aiScore,
+      confidence,
+      fortalezas: aiData.strengths || localResult.fortalezas,
+      brechas: aiData.gaps || localResult.brechas,
+      veredicto: aiData.verdict || localResult.veredicto,
+      siguiente_paso: actionMap[aiData.action] || localResult.siguiente_paso,
+      pregunta_entrevista: aiData.question || localResult.pregunta_entrevista,
+      analysisMode: "ai",
+      analysisTime: elapsed,
+    };
+  } catch (err) {
+    console.warn("Claude API fallback to local:", err.message);
+    return { ...localResult, analysisMode: "local" };
+  }
+}
+
+// ─── CLAUDE TOOL USE (AGENTIC LOOP) ──────────────────────────────────────────
+const TOOLS = [
+  {
+    name: "extract_keywords",
+    description: "Extract keywords from a job description, categorized as required vs desirable. Call this first to understand what the job needs.",
+    input_schema: {
+      type: "object",
+      properties: { job_description: { type: "string", description: "The full job description text" } },
+      required: ["job_description"],
+    },
+  },
+  {
+    name: "match_cv_keywords",
+    description: "Match a CV against extracted keywords using synonym detection. Returns matched/unmatched keywords with weighted scores. Call after extract_keywords.",
+    input_schema: {
+      type: "object",
+      properties: {
+        cv_text: { type: "string", description: "The candidate's CV text" },
+        keywords: { type: "array", items: { type: "string" }, description: "Keywords to match against" },
+        required_keywords: { type: "array", items: { type: "string" }, description: "Which keywords are required (weight 2x)" },
+      },
+      required: ["cv_text", "keywords"],
+    },
+  },
+  {
+    name: "evaluate_experience",
+    description: "Evaluate candidate's years of experience vs the job requirements. Returns years found and whether they meet the requirement.",
+    input_schema: {
+      type: "object",
+      properties: {
+        cv_text: { type: "string", description: "The candidate's CV text" },
+        job_description: { type: "string", description: "The job description to extract required years from" },
+      },
+      required: ["cv_text", "job_description"],
+    },
+  },
+  {
+    name: "check_education",
+    description: "Check the candidate's education level and certifications from their CV.",
+    input_schema: {
+      type: "object",
+      properties: { cv_text: { type: "string", description: "The candidate's CV text" } },
+      required: ["cv_text"],
+    },
+  },
+  {
+    name: "generate_interview_question",
+    description: "Generate a specific interview question based on gaps found in the candidate's profile. Call this last after analyzing gaps.",
+    input_schema: {
+      type: "object",
+      properties: {
+        candidate_strengths: { type: "array", items: { type: "string" }, description: "List of candidate strengths" },
+        gaps: { type: "array", items: { type: "string" }, description: "List of gaps or missing skills" },
+        job_title: { type: "string", description: "The job title" },
+      },
+      required: ["gaps"],
+    },
+  },
+];
+
+function executeToolCall(toolName, toolInput) {
+  switch (toolName) {
+    case "extract_keywords": {
+      const { keywords, requiredKeywords } = extractKeywords(toolInput.job_description || "");
+      return {
+        keywords,
+        required_keywords: Array.from(requiredKeywords),
+        total_keywords: keywords.length,
+        total_required: requiredKeywords.size,
+      };
+    }
+    case "match_cv_keywords": {
+      const reqSet = new Set(toolInput.required_keywords || []);
+      const { matched, unmatched, keywordScore } = matchKeywords(
+        toolInput.cv_text || "",
+        toolInput.keywords || [],
+        reqSet
+      );
+      return {
+        matched,
+        unmatched,
+        match_rate: toolInput.keywords?.length ? Math.round((matched.length / toolInput.keywords.length) * 100) : 0,
+        weighted_score: Math.round(keywordScore * 100),
+      };
+    }
+    case "evaluate_experience": {
+      const candidateYears = extractExperienceYears(toolInput.cv_text || "");
+      const requiredYears = extractRequiredYears(toolInput.job_description || "");
+      return {
+        candidate_years: candidateYears,
+        required_years: requiredYears,
+        meets_requirement: candidateYears >= requiredYears,
+        gap_years: Math.max(0, requiredYears - candidateYears),
+      };
+    }
+    case "check_education": {
+      const edu = detectEducation(toolInput.cv_text || "");
+      const langs = detectLanguages(toolInput.cv_text || "");
+      return {
+        education_level: edu.label,
+        education_score: edu.level,
+        certifications: edu.certifications,
+        languages: langs.map(l => ({ language: l.lang, level: l.level, score: l.score })),
+      };
+    }
+    case "generate_interview_question": {
+      const gaps = toolInput.gaps || [];
+      const strengths = toolInput.candidate_strengths || [];
+      const title = toolInput.job_title || "the role";
+      if (gaps.length === 0) {
+        return { question: `Given your strong background, describe a challenging project related to ${title} where you had to learn something new quickly.` };
+      }
+      const mainGap = gaps[0];
+      return {
+        question: `Regarding ${mainGap}: can you describe any exposure or learning you've done in this area? How would you approach ramping up on it for ${title}?`,
+        focus_area: mainGap,
+        context: strengths.length > 0 ? `Candidate is strong in: ${strengths.slice(0, 3).join(", ")}` : "No specific strengths identified",
+      };
+    }
+    default:
+      return { error: `Unknown tool: ${toolName}` };
+  }
+}
+
+async function analyzeWithToolUse(cvText, jobDescription, localResult, apiKey) {
+  if (!apiKey) return null;
+
+  try {
+    const startTime = Date.now();
+    const systemPrompt = `You are an expert HR analyst. You have tools to analyze a candidate's CV against a job description.
+
+Call the tools in this order:
+1. extract_keywords — to understand what the job requires
+2. match_cv_keywords — to see how the CV matches
+3. evaluate_experience — to check experience years
+4. check_education — to check education and certifications
+5. generate_interview_question — based on any gaps found
+
+After all tool calls, provide your final evaluation as JSON (no markdown):
+{"strengths":["s1","s2","s3"],"gaps":["g1","g2","g3"],"verdict":"2 line summary","action":"interview|waitlist|discard","question":"specific interview question","aiScore":0-100,"toolsUsed":true}`;
+
+    let messages = [
+      { role: "user", content: `Analyze this candidate:\n\nJob Description:\n${jobDescription}\n\nCandidate CV:\n${cvText}\n\nLocal keyword score for reference: ${localResult.score}/100\n\nPlease use the tools to perform a thorough analysis, then synthesize into a final evaluation.` },
+    ];
+
+    let toolCallCount = 0;
+    const maxIterations = 8;
+
+    for (let i = 0; i < maxIterations; i++) {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 1024,
+          system: systemPrompt,
+          tools: TOOLS,
+          messages,
+        }),
+      });
+
+      if (!response.ok) {
+        console.warn("Tool use API error:", response.status);
+        return null;
+      }
+
+      const data = await response.json();
+
+      // If end_turn, extract final text
+      if (data.stop_reason === "end_turn") {
+        const textBlock = data.content?.find(b => b.type === "text");
+        if (textBlock) {
+          try {
+            const jsonMatch = textBlock.text.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+              const aiData = JSON.parse(jsonMatch[0]);
+              const elapsed = Date.now() - startTime;
+              const aiScore = Math.max(0, Math.min(100, Number(aiData.aiScore) || localResult.score));
+              const finalScore = Math.round(localResult.score * 0.35 + aiScore * 0.65);
+              const scoreDiff = Math.abs(localResult.score - aiScore);
+              const confidence = scoreDiff <= 10 ? "high" : scoreDiff <= 25 ? "medium" : "low";
+
+              const actionMap = {
+                interview: "Agendar entrevista tecnica en los proximos 3 dias. Candidato prioritario.",
+                waitlist: "Anadir a lista de espera. Evaluar si las brechas son capacitables en 1-2 meses.",
+                discard: "Descartar para este puesto. Considerar para roles alternativos si aplica.",
+              };
+
+              return {
+                ...localResult,
+                score: finalScore,
+                localScore: localResult.score,
+                aiScore,
+                confidence,
+                fortalezas: aiData.strengths || localResult.fortalezas,
+                brechas: aiData.gaps || localResult.brechas,
+                veredicto: aiData.verdict || localResult.veredicto,
+                siguiente_paso: actionMap[aiData.action] || localResult.siguiente_paso,
+                pregunta_entrevista: aiData.question || localResult.pregunta_entrevista,
+                analysisMode: "tool_use",
+                analysisTime: elapsed,
+                toolCallCount,
+              };
+            }
+          } catch (parseErr) {
+            console.warn("Tool use parse error:", parseErr.message);
+          }
+        }
+        break;
+      }
+
+      // If tool_use, execute tools and continue the loop
+      if (data.stop_reason === "tool_use") {
+        // Add assistant message with all content blocks
+        messages.push({ role: "assistant", content: data.content });
+
+        // Execute each tool call and build tool results
+        const toolResults = [];
+        for (const block of data.content) {
+          if (block.type === "tool_use") {
+            toolCallCount++;
+            const result = executeToolCall(block.name, block.input);
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: block.id,
+              content: JSON.stringify(result),
+            });
+          }
+        }
+        messages.push({ role: "user", content: toolResults });
+        continue;
+      }
+
+      // Unknown stop reason
+      break;
+    }
+
+    return null;
+  } catch (err) {
+    console.warn("Tool use error, falling back:", err.message);
+    return null;
+  }
+}
+
 // ─── COMPARATIVE ANALYSIS ───────────────────────────────────────────────────
 function generateComparativeAnalysis(candidates, results, jobDesc) {
   const analyzed = candidates.filter(c => results[c.id]);
@@ -572,10 +885,498 @@ function generateComparativeAnalysis(candidates, results, jobDesc) {
   return { best, bestExplanation, commonGaps, heatmap, totalAnalyzed: analyzed.length };
 }
 
+// ─── TRANSLATIONS ─────────────────────────────────────────────────────────────
+const TRANSLATIONS = {
+  es: {
+    subtitle: "Filtrado y ranking de CVs con IA \u00b7 Analisis real de competencias \u00b7 RRHH automatizado",
+    analyzed: "Analizados",
+    suitable: "Aptos",
+    avgScore: "Score Prom.",
+    jobDesc: "Descripcion del Puesto",
+    selectPreset: "-- Seleccionar preset --",
+    minChars: (n) => `Minimo 20 caracteres para iniciar el analisis (${n}/20)`,
+    analyzeAll: "Analizar todos los CVs",
+    reAnalyzeAll: "Re-analizar todos",
+    analyzing: "Analizando...",
+    analyzingWith: "Analizando con IA...",
+    analyzingName: (i, total, name) => `Analizando ${i}/${total} -- ${name}...`,
+    notAnalyzed: "Sin analizar",
+    downloadReport: "Descargar reporte",
+    processSummary: "Resumen del Proceso",
+    totalCandidates: "Total candidatos",
+    suitableGte80: "Aptos (>=80)",
+    reviewRange: "Revisar (60-79)",
+    notSuitableLt60: "No aptos (<60)",
+    candidates: "Candidatos",
+    sortedByFit: "Ordenados por compatibilidad",
+    unsorted: "Sin analizar",
+    addCandidate: "+ Agregar candidato",
+    filterAll: "Todos",
+    filterSuitable: "Aptos",
+    filterReview: "Revisar",
+    filterNotSuitable: "No aptos",
+    noCandidatesInCategory: "No hay candidatos en esta categoria",
+    footer: "HRSCOUT \u00b7 ANALISIS REAL DE CVs \u00b7 FILTRADO AUTOMATICO \u00b7 RANKING POR COMPATIBILIDAD",
+    close: "Cerrar",
+    viewAnalysis: "Ver analisis",
+    analyzeAI: "Analizar IA",
+    reAnalyze: "Re-analizar",
+    yrsExp: "anos exp.",
+    strengths: "Fortalezas",
+    gaps: "Brechas",
+    verdict: "Veredicto",
+    interviewQuestion: "PREGUNTA CLAVE PARA ENTREVISTA: ",
+    scoreSuitable: "Apto",
+    scoreReview: "Revisar",
+    scoreNotSuitable: "No apto",
+    addCandidateTitle: "Agregar Candidato",
+    addCandidateDesc: "Agrega un CV personalizado para analizar contra la descripcion del puesto",
+    candidateName: "Nombre del candidato",
+    candidateNamePlaceholder: "Ej: Maria Garcia Lopez",
+    pasteText: "Pegar texto",
+    uploadFile: "Subir archivo .txt",
+    cvText: "Texto del CV",
+    cvPlaceholder: "Pega aqui el contenido del CV...\n\nEj:\nIngeniero en Software | 5 anos de experiencia\nStack: React, Python, AWS...\nEducacion: Licenciatura en...\nIdiomas: Ingles C1...",
+    fileLoaded: (n) => `Archivo cargado (${n} caracteres)`,
+    clickToSelect: "Haz clic para seleccionar un archivo .txt",
+    preview: "Vista previa",
+    minCharsCV: (n) => `${n}/50 caracteres minimo`,
+    cancel: "Cancelar",
+    addCandidateBtn: "Agregar candidato",
+    comparativeAnalysis: "Analisis Comparativo",
+    bestCandidate: "Mejor Candidato",
+    commonGaps: "Brechas Comunes",
+    uncovered: (count, total, pct) => `${count}/${total} sin cubrir (${pct}%)`,
+    skillCoverage: "Cobertura de Habilidades",
+    coveredBy: "Cubierto por",
+    noCoverage: "Sin cobertura",
+    reportTitle: "=== REPORTE DE ANALISIS DE CVs -- HRScout AI ===",
+    reportDate: "Fecha",
+    reportJobDesc: "DESCRIPCION DEL PUESTO:",
+    reportSuitable: "APTO",
+    reportReview: "REVISAR",
+    reportNotSuitable: "NO APTO",
+    reportSummary: (total, aptos, revisar, noAptos) => `RESUMEN: ${total} analizados | ${aptos} aptos | ${revisar} revisar | ${noAptos} no aptos`,
+    ctaText: "Esto es una demo gratuita de Impulso IA. Quieres algo asi para tu negocio?",
+    ctaButton: "Platiquemos",
+    removeCandidateTitle: "Eliminar candidato",
+    top: "Top",
+    apiKeyLabel: "Claude API Key (opcional)",
+    apiKeyPlaceholder: "sk-ant-... (para analisis con IA real)",
+    apiKeySet: "API Key configurada",
+    apiKeyRemove: "Quitar",
+    localMode: "Local",
+    aiMode: "IA",
+    confidenceHigh: "Confianza alta",
+    confidenceMedium: "Confianza media",
+    confidenceLow: "Confianza baja",
+    keywordScore: "Score Keywords",
+    aiScoreLabel: "Score IA",
+    clearResults: "Limpiar resultados",
+    clearConfirm: "Se eliminaran todos los resultados. Continuar?",
+    copyToClipboard: "Copiar",
+    copied: "Copiado!",
+    exportJSON: "Exportar JSON",
+    uploadFilePdf: "Subir .txt / .pdf",
+    pdfNote: "Para mejores resultados, pega el texto directamente o sube archivos .txt",
+    analyticsTitle: "Analiticas",
+    scoreDistribution: "Distribucion de Scores",
+    avgScoreLabel: "Score Promedio",
+    commonMissingSkills: "Skills Faltantes Comunes",
+    totalAnalysisTime: "Tiempo total de analisis",
+    range0_40: "0-40",
+    range40_60: "40-60",
+    range60_80: "60-80",
+    range80_100: "80-100",
+    toolUseMode: "Tool Use",
+    toolCalls: "llamadas",
+  },
+  en: {
+    subtitle: "AI-powered CV screening \u00b7 Real competency analysis \u00b7 Automated HR",
+    analyzed: "Analyzed",
+    suitable: "Suitable",
+    avgScore: "Avg. Score",
+    jobDesc: "Job Description",
+    selectPreset: "-- Select preset --",
+    minChars: (n) => `Minimum 20 characters to start analysis (${n}/20)`,
+    analyzeAll: "Analyze all CVs",
+    reAnalyzeAll: "Re-analyze all",
+    analyzing: "Analyzing...",
+    analyzingWith: "Analyzing with AI...",
+    analyzingName: (i, total, name) => `Analyzing ${i}/${total} -- ${name}...`,
+    notAnalyzed: "Not analyzed",
+    downloadReport: "Download report",
+    processSummary: "Process Summary",
+    totalCandidates: "Total candidates",
+    suitableGte80: "Suitable (>=80)",
+    reviewRange: "Review (60-79)",
+    notSuitableLt60: "Not suitable (<60)",
+    candidates: "Candidates",
+    sortedByFit: "Sorted by compatibility",
+    unsorted: "Not analyzed",
+    addCandidate: "+ Add candidate",
+    filterAll: "All",
+    filterSuitable: "Suitable",
+    filterReview: "Review",
+    filterNotSuitable: "Not suitable",
+    noCandidatesInCategory: "No candidates in this category",
+    footer: "HRSCOUT \u00b7 REAL CV ANALYSIS \u00b7 AUTOMATED SCREENING \u00b7 COMPATIBILITY RANKING",
+    close: "Close",
+    viewAnalysis: "View analysis",
+    analyzeAI: "Analyze AI",
+    reAnalyze: "Re-analyze",
+    yrsExp: "yrs exp.",
+    strengths: "Strengths",
+    gaps: "Gaps",
+    verdict: "Verdict",
+    interviewQuestion: "KEY INTERVIEW QUESTION: ",
+    scoreSuitable: "Suitable",
+    scoreReview: "Review",
+    scoreNotSuitable: "Not suitable",
+    addCandidateTitle: "Add Candidate",
+    addCandidateDesc: "Add a custom CV to analyze against the job description",
+    candidateName: "Candidate name",
+    candidateNamePlaceholder: "E.g.: Maria Garcia Lopez",
+    pasteText: "Paste text",
+    uploadFile: "Upload .txt file",
+    cvText: "CV Text",
+    cvPlaceholder: "Paste the CV content here...\n\nE.g.:\nSoftware Engineer | 5 years of experience\nStack: React, Python, AWS...\nEducation: Bachelor's in...\nLanguages: English C1...",
+    fileLoaded: (n) => `File loaded (${n} characters)`,
+    clickToSelect: "Click to select a .txt file",
+    preview: "Preview",
+    minCharsCV: (n) => `${n}/50 characters minimum`,
+    cancel: "Cancel",
+    addCandidateBtn: "Add candidate",
+    comparativeAnalysis: "Comparative Analysis",
+    bestCandidate: "Best Candidate",
+    commonGaps: "Common Gaps",
+    uncovered: (count, total, pct) => `${count}/${total} uncovered (${pct}%)`,
+    skillCoverage: "Skill Coverage",
+    coveredBy: "Covered by",
+    noCoverage: "No coverage",
+    reportTitle: "=== CV ANALYSIS REPORT -- HRScout AI ===",
+    reportDate: "Date",
+    reportJobDesc: "JOB DESCRIPTION:",
+    reportSuitable: "SUITABLE",
+    reportReview: "REVIEW",
+    reportNotSuitable: "NOT SUITABLE",
+    reportSummary: (total, aptos, revisar, noAptos) => `SUMMARY: ${total} analyzed | ${aptos} suitable | ${revisar} review | ${noAptos} not suitable`,
+    ctaText: "This is a free demo by Impulso IA. Want something like this for your business?",
+    ctaButton: "Let's talk",
+    removeCandidateTitle: "Remove candidate",
+    top: "Top",
+    apiKeyLabel: "Claude API Key (optional)",
+    apiKeyPlaceholder: "sk-ant-... (for real AI analysis)",
+    apiKeySet: "API Key configured",
+    apiKeyRemove: "Remove",
+    localMode: "Local",
+    aiMode: "AI",
+    confidenceHigh: "High confidence",
+    confidenceMedium: "Medium confidence",
+    confidenceLow: "Low confidence",
+    keywordScore: "Keyword Score",
+    aiScoreLabel: "AI Score",
+    clearResults: "Clear results",
+    clearConfirm: "All results will be deleted. Continue?",
+    copyToClipboard: "Copy",
+    copied: "Copied!",
+    exportJSON: "Export JSON",
+    uploadFilePdf: "Upload .txt / .pdf",
+    pdfNote: "For best results, paste CV text directly or upload .txt files",
+    analyticsTitle: "Analytics",
+    scoreDistribution: "Score Distribution",
+    avgScoreLabel: "Average Score",
+    commonMissingSkills: "Common Missing Skills",
+    totalAnalysisTime: "Total analysis time",
+    range0_40: "0-40",
+    range40_60: "40-60",
+    range60_80: "60-80",
+    range80_100: "80-100",
+    toolUseMode: "Tool Use",
+    toolCalls: "calls",
+  },
+};
+
+// ─── TOUR STEPS CONFIG ───────────────────────────────────────────────────────
+const TOUR_STEPS = [
+  {
+    id: "welcome",
+    target: null,
+    title: { en: "HRScout — AI Resume Screening", es: "HRScout — Filtrado de CVs con IA" },
+    text: {
+      en: "This tool analyzes resumes against job descriptions using AI. It extracts keywords, matches skills with synonyms, and ranks candidates by fit score (0-100). Paste a job description and let AI screen your candidates instantly.\n\nLet me show you how it works!",
+      es: "Esta herramienta analiza CVs contra descripciones de puesto usando IA. Extrae palabras clave, matchea habilidades con sin\u00f3nimos, y rankea candidatos por puntaje de ajuste (0-100). Pega una descripci\u00f3n de puesto y deja que la IA filtre tus candidatos al instante.\n\n\u00a1D\u00e9jame mostrarte c\u00f3mo funciona!"
+    },
+    btn: { en: "Start Tour \u2192", es: "Iniciar Tour \u2192" },
+  },
+  {
+    id: "job-desc",
+    target: "[data-tour='job-desc']",
+    title: { en: "Job Description", es: "Descripci\u00f3n del Puesto" },
+    text: {
+      en: "This is where you paste or type the job description. The AI will extract keywords and required skills from this text to match against candidate resumes.",
+      es: "Aqu\u00ed pegas o escribes la descripci\u00f3n del puesto. La IA extraer\u00e1 palabras clave y habilidades requeridas de este texto para compararlas con los CVs de los candidatos."
+    },
+    btn: { en: "Next \u2192", es: "Siguiente \u2192" },
+  },
+  {
+    id: "preset",
+    target: "[data-tour='preset-select']",
+    title: { en: "Select a Preset", es: "Selecciona un Preset" },
+    text: {
+      en: "Choose from pre-built job descriptions to quickly get started. We have presets for AI Specialist, Frontend Developer, Product Manager, Data Scientist, and Digital Marketing.",
+      es: "Elige entre descripciones de puesto predefinidas para empezar r\u00e1pido. Tenemos presets para Especialista en IA, Desarrollador Frontend, Product Manager, Data Scientist y Marketing Digital."
+    },
+    btn: { en: "Try it \u2192", es: "Probar \u2192" },
+    action: "selectPreset",
+  },
+  {
+    id: "candidates",
+    target: "[data-tour='candidates']",
+    title: { en: "Candidate List", es: "Lista de Candidatos" },
+    text: {
+      en: "These are the candidates to evaluate. Each has a resume that will be scored from 0-100 based on keyword matching, synonym detection, experience, education, and language skills.",
+      es: "Estos son los candidatos a evaluar. Cada uno tiene un CV que ser\u00e1 puntuado de 0-100 basado en coincidencia de palabras clave, detecci\u00f3n de sin\u00f3nimos, experiencia, educaci\u00f3n e idiomas."
+    },
+    btn: { en: "Analyze \u2192", es: "Analizar \u2192" },
+    action: "analyzeAll",
+  },
+  {
+    id: "top-candidate",
+    target: "[data-tour='candidate-0']",
+    title: { en: "Top Candidate", es: "Mejor Candidato" },
+    text: {
+      en: "After analysis, candidates are ranked by compatibility score. The top candidate shows the highest match. Click 'View analysis' to see strengths, gaps, verdict, and a suggested interview question.",
+      es: "Despu\u00e9s del an\u00e1lisis, los candidatos se ordenan por puntaje de compatibilidad. El mejor candidato muestra el mayor match. Haz clic en 'Ver an\u00e1lisis' para ver fortalezas, brechas, veredicto y una pregunta sugerida para entrevista."
+    },
+    btn: { en: "Next \u2192", es: "Siguiente \u2192" },
+  },
+  {
+    id: "export",
+    target: "[data-tour='export-area']",
+    title: { en: "Export & Download", es: "Exportar y Descargar" },
+    text: {
+      en: "Download a full text report or export results as JSON. You can also copy individual candidate analyses to your clipboard from their expanded view. That's it — you're ready to screen candidates!",
+      es: "Descarga un reporte completo en texto o exporta los resultados como JSON. Tambi\u00e9n puedes copiar el an\u00e1lisis individual de cada candidato desde su vista expandida. \u00a1Eso es todo, ya est\u00e1s listo para filtrar candidatos!"
+    },
+    btn: { en: "Finish \u2713", es: "Finalizar \u2713" },
+  },
+];
+
+// ─── TOUR OVERLAY COMPONENT ─────────────────────────────────────────────────
+function TourOverlay({ tourStep, tourActive, lang, setLang, onNext, onSkip, totalSteps }) {
+  const step = TOUR_STEPS[tourStep];
+  if (!tourActive || !step) return null;
+
+  const isWelcome = tourStep === 0;
+
+  // Auto-scroll to target
+  useEffect(() => {
+    if (step.target) {
+      const el = document.querySelector(step.target);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    }
+  }, [tourStep, step.target]);
+
+  // Get target rect for spotlight
+  const [targetRect, setTargetRect] = useState(null);
+  useEffect(() => {
+    if (!step.target) { setTargetRect(null); return; }
+    const updateRect = () => {
+      const el = document.querySelector(step.target);
+      if (el) {
+        const r = el.getBoundingClientRect();
+        setTargetRect({ top: r.top - 8, left: r.left - 8, width: r.width + 16, height: r.height + 16 });
+      }
+    };
+    // Delay to let scroll settle
+    const timer = setTimeout(updateRect, 350);
+    window.addEventListener("resize", updateRect);
+    window.addEventListener("scroll", updateRect, true);
+    return () => { clearTimeout(timer); window.removeEventListener("resize", updateRect); window.removeEventListener("scroll", updateRect, true); };
+  }, [tourStep, step.target]);
+
+  // Welcome modal (step 0)
+  if (isWelcome) {
+    return (
+      <div style={{
+        position: "fixed", inset: 0, zIndex: 10000,
+        background: "rgba(0,0,0,0.82)", backdropFilter: "blur(6px)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        animation: "fadeUp 0.3s ease",
+        fontFamily: "'DM Sans', sans-serif",
+      }}>
+        <div style={{
+          background: "#14151F", border: "1px solid rgba(99,102,241,0.3)",
+          borderRadius: 16, padding: "36px 32px", width: "92%", maxWidth: 480,
+          boxShadow: "0 24px 64px rgba(0,0,0,0.6), 0 0 40px rgba(99,102,241,0.15)",
+          textAlign: "center",
+        }}>
+          <h2 style={{ margin: "0 0 6px", fontSize: 24, fontWeight: 800, color: "#F8FAFC", letterSpacing: "-0.02em" }}>
+            {step.title[lang]}
+          </h2>
+          <div style={{ margin: "16px 0 20px", fontSize: 14, color: "rgba(255,255,255,0.65)", lineHeight: 1.7, whiteSpace: "pre-line", textAlign: "left" }}>
+            {step.text[lang]}
+          </div>
+
+          {/* Language selector */}
+          <div style={{ display: "flex", justifyContent: "center", gap: 8, marginBottom: 20 }}>
+            {["es", "en"].map(code => (
+              <button
+                key={code}
+                onClick={() => setLang(code)}
+                style={{
+                  padding: "8px 20px", borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: "pointer",
+                  background: lang === code ? "rgba(99,102,241,0.2)" : "rgba(255,255,255,0.04)",
+                  border: `1px solid ${lang === code ? "rgba(99,102,241,0.5)" : "rgba(255,255,255,0.1)"}`,
+                  color: lang === code ? "#A5B4FC" : "rgba(255,255,255,0.4)",
+                  fontFamily: "'DM Mono', monospace", letterSpacing: "0.08em",
+                  transition: "all 0.15s",
+                }}
+              >
+                {code.toUpperCase()}
+              </button>
+            ))}
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "center", gap: 12 }}>
+            <button
+              onClick={onSkip}
+              style={{
+                padding: "10px 22px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer",
+                background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)",
+                color: "rgba(255,255,255,0.4)", fontFamily: "'DM Sans', sans-serif",
+                transition: "all 0.15s",
+              }}
+            >
+              Skip
+            </button>
+            <button
+              onClick={onNext}
+              style={{
+                padding: "10px 28px", borderRadius: 8, fontSize: 14, fontWeight: 700, cursor: "pointer",
+                background: "linear-gradient(135deg, #6366F1, #4F46E5)", border: "none",
+                color: "#fff", fontFamily: "'DM Sans', sans-serif",
+                boxShadow: "0 0 20px rgba(99,102,241,0.4)",
+                transition: "all 0.15s",
+              }}
+            >
+              {step.btn[lang]}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Tooltip steps with spotlight
+  const tooltipStyle = (() => {
+    if (!targetRect) return { top: "50%", left: "50%", transform: "translate(-50%, -50%)" };
+    const viewH = window.innerHeight;
+    const below = targetRect.top + targetRect.height + 16;
+    const above = targetRect.top - 16;
+    if (below + 200 < viewH) {
+      return { top: below, left: Math.max(16, Math.min(targetRect.left, window.innerWidth - 360)), transform: "none" };
+    }
+    return { top: Math.max(16, above - 200), left: Math.max(16, Math.min(targetRect.left, window.innerWidth - 360)), transform: "none" };
+  })();
+
+  return (
+    <>
+      {/* Dark overlay with spotlight cutout */}
+      <div style={{ position: "fixed", inset: 0, zIndex: 9998, pointerEvents: "none" }}>
+        <svg width="100%" height="100%" style={{ position: "absolute", inset: 0 }}>
+          <defs>
+            <mask id="tour-spotlight-mask">
+              <rect width="100%" height="100%" fill="white" />
+              {targetRect && (
+                <rect
+                  x={targetRect.left} y={targetRect.top}
+                  width={targetRect.width} height={targetRect.height}
+                  rx="12" fill="black"
+                />
+              )}
+            </mask>
+          </defs>
+          <rect width="100%" height="100%" fill="rgba(0,0,0,0.72)" mask="url(#tour-spotlight-mask)" />
+        </svg>
+      </div>
+
+      {/* Spotlight glow border */}
+      {targetRect && (
+        <div style={{
+          position: "fixed", zIndex: 9999,
+          top: targetRect.top, left: targetRect.left,
+          width: targetRect.width, height: targetRect.height,
+          borderRadius: 12, border: "2px solid rgba(99,102,241,0.5)",
+          boxShadow: "0 0 24px rgba(99,102,241,0.25)",
+          pointerEvents: "none",
+        }} />
+      )}
+
+      {/* Click blocker */}
+      <div style={{ position: "fixed", inset: 0, zIndex: 9999, cursor: "default" }} onClick={e => e.stopPropagation()} />
+
+      {/* Tooltip */}
+      <div style={{
+        position: "fixed", zIndex: 10001,
+        ...tooltipStyle,
+        background: "#14151F", border: "1px solid rgba(99,102,241,0.35)",
+        borderRadius: 12, padding: "18px 20px", width: 340, maxWidth: "90vw",
+        boxShadow: "0 16px 48px rgba(0,0,0,0.5), 0 0 20px rgba(99,102,241,0.1)",
+        animation: "fadeUp 0.25s ease",
+        fontFamily: "'DM Sans', sans-serif",
+      }}>
+        {/* Step counter */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+          <span style={{ fontSize: 10, color: "rgba(255,255,255,0.35)", fontFamily: "'DM Mono', monospace", letterSpacing: "0.08em" }}>
+            {lang === "es" ? `Paso ${tourStep} de ${totalSteps - 1}` : `Step ${tourStep} of ${totalSteps - 1}`}
+          </span>
+          <button
+            onClick={onSkip}
+            style={{
+              background: "none", border: "none", cursor: "pointer",
+              fontSize: 10, color: "rgba(255,255,255,0.3)",
+              fontFamily: "'DM Mono', monospace", textDecoration: "underline",
+              padding: 0,
+            }}
+          >
+            {lang === "es" ? "Saltar tour" : "Skip Tour"}
+          </button>
+        </div>
+
+        <h3 style={{ margin: "0 0 6px", fontSize: 15, fontWeight: 700, color: "#F8FAFC" }}>
+          {step.title[lang]}
+        </h3>
+        <p style={{ margin: "0 0 16px", fontSize: 13, color: "rgba(255,255,255,0.6)", lineHeight: 1.6 }}>
+          {step.text[lang]}
+        </p>
+
+        <button
+          onClick={onNext}
+          style={{
+            padding: "9px 22px", borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: "pointer",
+            background: "linear-gradient(135deg, #6366F1, #4F46E5)", border: "none",
+            color: "#fff", fontFamily: "'DM Sans', sans-serif",
+            boxShadow: "0 0 16px rgba(99,102,241,0.35)",
+            transition: "all 0.15s",
+          }}
+        >
+          {step.btn[lang]}
+        </button>
+      </div>
+    </>
+  );
+}
+
 // ─── BADGE DE SCORE ───────────────────────────────────────────────────────────
-function ScoreBadge({ score }) {
+function ScoreBadge({ score, t, analysisMode }) {
   const color = score >= 80 ? "#10B981" : score >= 60 ? "#F59E0B" : "#EF4444";
-  const label = score >= 80 ? "Apto" : score >= 60 ? "Revisar" : "No apto";
+  const label = score >= 80 ? t.scoreSuitable : score >= 60 ? t.scoreReview : t.scoreNotSuitable;
+  const modeColor = analysisMode === "tool_use" ? "#34D399" : analysisMode === "ai" ? "#818CF8" : "rgba(255,255,255,0.3)";
+  const modeLabel = analysisMode === "tool_use" ? (t.toolUseMode || "Tool Use") : analysisMode === "ai" ? t.aiMode : t.localMode;
   return (
     <div style={{ textAlign: "center" }}>
       <div style={{
@@ -586,8 +1387,19 @@ function ScoreBadge({ score }) {
         fontSize: 15, fontWeight: 800, color,
         fontFamily: "'DM Mono', monospace",
         boxShadow: `0 0 12px ${color}30`,
+        position: "relative",
       }}>
         {score}
+        {analysisMode && (
+          <span style={{
+            position: "absolute", top: -6, right: -6,
+            fontSize: 7, padding: "1px 4px", borderRadius: 3,
+            background: analysisMode === "tool_use" ? "rgba(52,211,153,0.25)" : analysisMode === "ai" ? "rgba(99,102,241,0.25)" : "rgba(255,255,255,0.08)",
+            border: `1px solid ${modeColor}`,
+            color: modeColor, fontWeight: 700,
+            fontFamily: "'DM Mono', monospace",
+          }}>{modeLabel}</span>
+        )}
       </div>
       <span style={{ fontSize: 9, color, fontFamily: "'DM Mono', monospace", letterSpacing: "0.08em", display: "block", marginTop: 3 }}>
         {label}
@@ -597,10 +1409,11 @@ function ScoreBadge({ score }) {
 }
 
 // ─── CANDIDATE CARD ───────────────────────────────────────────────────────────
-function CandidateCard({ candidate, rank, onAnalyze, analyzing, result, globalAnalyzing, cardRef, onRemove, isCustom }) {
+function CandidateCard({ candidate, rank, onAnalyze, analyzing, result, globalAnalyzing, cardRef, onRemove, isCustom, t }) {
   const [expanded, setExpanded] = useState(false);
   const [hovered, setHovered] = useState(false);
   const [justFinished, setJustFinished] = useState(false);
+  const [copied, setCopied] = useState(false);
   const prevResult = useRef(null);
   const rankColors = ["#F59E0B", "#94A3B8", "#CD7F32"];
 
@@ -644,7 +1457,7 @@ function CandidateCard({ candidate, rank, onAnalyze, analyzing, result, globalAn
         </div>
 
         {/* Score */}
-        {result ? <ScoreBadge score={result.score} /> : (
+        {result ? <ScoreBadge score={result.score} t={t} analysisMode={result.analysisMode} /> : (
           <div style={{
             width: 52, height: 52, borderRadius: "50%",
             border: "2px dashed rgba(255,255,255,0.1)",
@@ -672,12 +1485,12 @@ function CandidateCard({ candidate, rank, onAnalyze, analyzing, result, globalAn
           </p>
           {result && (
             <p style={{ margin: "3px 0 0", fontSize: 11, color: "rgba(255,255,255,0.4)" }}>
-              {result.titulo} &middot; {result.experiencia_anos} anos exp.
+              {result.titulo} &middot; {result.experiencia_anos} {t.yrsExp}
             </p>
           )}
           {!result && (
             <p style={{ margin: "3px 0 0", fontSize: 11, color: analyzing ? "#818CF8" : "rgba(255,255,255,0.3)", fontStyle: "italic" }}>
-              {analyzing ? "Analizando con IA..." : "Sin analizar"}
+              {analyzing ? t.analyzingWith : t.notAnalyzed}
             </p>
           )}
         </div>
@@ -709,7 +1522,7 @@ function CandidateCard({ candidate, rank, onAnalyze, analyzing, result, globalAn
               onMouseEnter={e => { e.currentTarget.style.background = "rgba(255,255,255,0.1)"; }}
               onMouseLeave={e => { e.currentTarget.style.background = "rgba(255,255,255,0.05)"; }}
             >
-              {expanded ? "Cerrar" : "Ver analisis"}
+              {expanded ? t.close : t.viewAnalysis}
             </button>
           )}
           <button
@@ -725,12 +1538,12 @@ function CandidateCard({ candidate, rank, onAnalyze, analyzing, result, globalAn
             onMouseEnter={e => { if (!analyzing && !globalAnalyzing) e.currentTarget.style.background = "rgba(99,102,241,0.22)"; }}
             onMouseLeave={e => { if (!analyzing && !globalAnalyzing) e.currentTarget.style.background = "rgba(99,102,241,0.12)"; }}
           >
-            {analyzing ? "Analizando..." : result ? "Re-analizar" : "Analizar IA"}
+            {analyzing ? t.analyzing : result ? t.reAnalyze : t.analyzeAI}
           </button>
           {isCustom && (
             <button
               onClick={() => onRemove(candidate.id)}
-              title="Eliminar candidato"
+              title={t.removeCandidateTitle}
               style={{
                 background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)",
                 borderRadius: 6, padding: "5px 8px", cursor: "pointer",
@@ -753,24 +1566,49 @@ function CandidateCard({ candidate, rank, onAnalyze, analyzing, result, globalAn
           borderTop: "1px solid rgba(255,255,255,0.06)",
           animation: "fadeUp 0.3s ease",
         }}>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginTop: 14 }}>
+          {/* Dual score display when AI or Tool Use was used */}
+          {(result.analysisMode === "ai" || result.analysisMode === "tool_use") && (
+            <div style={{ display: "flex", gap: 10, marginTop: 14, marginBottom: 4, flexWrap: "wrap" }}>
+              <div style={{ padding: "6px 12px", borderRadius: 6, background: result.analysisMode === "tool_use" ? "rgba(52,211,153,0.08)" : "rgba(99,102,241,0.08)", border: `1px solid ${result.analysisMode === "tool_use" ? "rgba(52,211,153,0.2)" : "rgba(99,102,241,0.2)"}`, fontSize: 11, color: result.analysisMode === "tool_use" ? "#6EE7B7" : "#A5B4FC", fontFamily: "'DM Mono', monospace" }}>
+                {t.aiScoreLabel}: <b>{result.aiScore}</b>
+              </div>
+              <div style={{ padding: "6px 12px", borderRadius: 6, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)", fontSize: 11, color: "rgba(255,255,255,0.5)", fontFamily: "'DM Mono', monospace" }}>
+                {t.keywordScore}: <b>{result.localScore}</b>
+              </div>
+              <div style={{
+                padding: "6px 12px", borderRadius: 6, fontSize: 11, fontFamily: "'DM Mono', monospace",
+                background: result.confidence === "high" ? "rgba(16,185,129,0.08)" : result.confidence === "medium" ? "rgba(245,158,11,0.08)" : "rgba(239,68,68,0.08)",
+                border: `1px solid ${result.confidence === "high" ? "rgba(16,185,129,0.2)" : result.confidence === "medium" ? "rgba(245,158,11,0.2)" : "rgba(239,68,68,0.2)"}`,
+                color: result.confidence === "high" ? "#10B981" : result.confidence === "medium" ? "#F59E0B" : "#EF4444",
+              }}>
+                {result.confidence === "high" ? t.confidenceHigh : result.confidence === "medium" ? t.confidenceMedium : t.confidenceLow}
+              </div>
+              {result.analysisMode === "tool_use" && (
+                <div style={{ padding: "6px 12px", borderRadius: 6, background: "rgba(52,211,153,0.08)", border: "1px solid rgba(52,211,153,0.2)", fontSize: 11, color: "#34D399", fontFamily: "'DM Mono', monospace", fontWeight: 700 }}>
+                  {t.toolUseMode || "Tool Use"} ({result.toolCallCount || 0} {t.toolCalls || "calls"})
+                </div>
+              )}
+            </div>
+          )}
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginTop: (result.analysisMode === "ai" || result.analysisMode === "tool_use") ? 4 : 14 }}>
             {/* Fortalezas */}
             <div style={{ background: "rgba(16,185,129,0.06)", border: "1px solid rgba(16,185,129,0.15)", borderRadius: 8, padding: 12 }}>
-              <p style={{ margin: "0 0 8px", fontSize: 10, fontWeight: 700, color: "#10B981", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>&#10003; Fortalezas</p>
+              <p style={{ margin: "0 0 8px", fontSize: 10, fontWeight: 700, color: "#10B981", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>&#10003; {t.strengths}</p>
               {result.fortalezas?.map((f, i) => (
                 <p key={i} style={{ margin: "0 0 4px", fontSize: 11, color: "#D1FAE5", lineHeight: 1.5 }}>&#8226; {f}</p>
               ))}
             </div>
             {/* Debilidades */}
             <div style={{ background: "rgba(239,68,68,0.06)", border: "1px solid rgba(239,68,68,0.15)", borderRadius: 8, padding: 12 }}>
-              <p style={{ margin: "0 0 8px", fontSize: 10, fontWeight: 700, color: "#EF4444", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>&#10007; Brechas</p>
+              <p style={{ margin: "0 0 8px", fontSize: 10, fontWeight: 700, color: "#EF4444", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>&#10007; {t.gaps}</p>
               {result.brechas?.map((b, i) => (
                 <p key={i} style={{ margin: "0 0 4px", fontSize: 11, color: "#FEE2E2", lineHeight: 1.5 }}>&#8226; {b}</p>
               ))}
             </div>
             {/* Veredicto */}
             <div style={{ background: "rgba(99,102,241,0.06)", border: "1px solid rgba(99,102,241,0.15)", borderRadius: 8, padding: 12 }}>
-              <p style={{ margin: "0 0 8px", fontSize: 10, fontWeight: 700, color: "#818CF8", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>Veredicto</p>
+              <p style={{ margin: "0 0 8px", fontSize: 10, fontWeight: 700, color: "#818CF8", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>{t.verdict}</p>
               <p style={{ margin: "0 0 6px", fontSize: 11, color: "#E0E7FF", lineHeight: 1.5 }}>{result.veredicto}</p>
               <p style={{ margin: 0, fontSize: 10, color: "rgba(255,255,255,0.4)", fontStyle: "italic" }}>
                 {result.siguiente_paso}
@@ -781,10 +1619,32 @@ function CandidateCard({ candidate, rank, onAnalyze, analyzing, result, globalAn
           {/* Pregunta de entrevista */}
           {result.pregunta_entrevista && (
             <div style={{ marginTop: 10, padding: "10px 14px", background: "rgba(245,158,11,0.06)", border: "1px solid rgba(245,158,11,0.15)", borderRadius: 8 }}>
-              <span style={{ fontSize: 10, color: "#F59E0B", fontWeight: 700, fontFamily: "'DM Mono', monospace" }}>PREGUNTA CLAVE PARA ENTREVISTA: </span>
+              <span style={{ fontSize: 10, color: "#F59E0B", fontWeight: 700, fontFamily: "'DM Mono', monospace" }}>{t.interviewQuestion}</span>
               <span style={{ fontSize: 11, color: "#FEF3C7" }}>{result.pregunta_entrevista}</span>
             </div>
           )}
+
+          {/* Copy to Clipboard */}
+          <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
+            <button
+              onClick={() => {
+                const text = `${candidate.name} - Score: ${result.score}/100${(result.analysisMode === "ai" || result.analysisMode === "tool_use") ? ` (AI: ${result.aiScore}, Keywords: ${result.localScore}${result.analysisMode === "tool_use" ? ", Mode: Tool Use" : ""})` : ""}\n\nStrengths:\n${result.fortalezas?.map(f => `- ${f}`).join("\n")}\n\nGaps:\n${result.brechas?.map(b => `- ${b}`).join("\n")}\n\nVerdict: ${result.veredicto}\nNext step: ${result.siguiente_paso}\nInterview question: ${result.pregunta_entrevista}`;
+                navigator.clipboard.writeText(text).then(() => {
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 2000);
+                });
+              }}
+              style={{
+                padding: "5px 12px", borderRadius: 6, fontSize: 10, fontWeight: 600, cursor: "pointer",
+                background: copied ? "rgba(16,185,129,0.15)" : "rgba(255,255,255,0.05)",
+                border: `1px solid ${copied ? "rgba(16,185,129,0.3)" : "rgba(255,255,255,0.1)"}`,
+                color: copied ? "#10B981" : "rgba(255,255,255,0.4)",
+                fontFamily: "'DM Mono', monospace", transition: "all 0.15s",
+              }}
+            >
+              {copied ? t.copied : t.copyToClipboard}
+            </button>
+          </div>
         </div>
       )}
     </div>
@@ -792,7 +1652,7 @@ function CandidateCard({ candidate, rank, onAnalyze, analyzing, result, globalAn
 }
 
 // ─── ADD CANDIDATE MODAL ────────────────────────────────────────────────────
-function AddCandidateModal({ onAdd, onClose }) {
+function AddCandidateModal({ onAdd, onClose, t }) {
   const [name, setName] = useState("");
   const [cvText, setCvText] = useState("");
   const [mode, setMode] = useState("paste"); // "paste" | "file"
@@ -805,7 +1665,15 @@ function AddCandidateModal({ onAdd, onClose }) {
     if (!file) return;
     const reader = new FileReader();
     reader.onload = (ev) => {
-      setCvText(ev.target?.result || "");
+      let text = ev.target?.result || "";
+      // For PDF files read as text, clean up garbled binary content
+      if (file.name.toLowerCase().endsWith(".pdf")) {
+        // Try to extract readable text from PDF binary
+        const readable = text.replace(/[^\x20-\x7E\n\r\t]/g, " ").replace(/\s{3,}/g, "\n").trim();
+        setCvText(readable.length > 50 ? readable : "");
+      } else {
+        setCvText(text);
+      }
     };
     reader.readAsText(file);
   };
@@ -829,20 +1697,20 @@ function AddCandidateModal({ onAdd, onClose }) {
         boxShadow: "0 24px 48px rgba(0,0,0,0.5)",
       }} onClick={e => e.stopPropagation()}>
         <h3 style={{ margin: "0 0 4px", fontSize: 18, fontWeight: 700, color: "#F8FAFC" }}>
-          Agregar Candidato
+          {t.addCandidateTitle}
         </h3>
         <p style={{ margin: "0 0 18px", fontSize: 12, color: "rgba(255,255,255,0.4)" }}>
-          Agrega un CV personalizado para analizar contra la descripcion del puesto
+          {t.addCandidateDesc}
         </p>
 
         {/* Name */}
         <label style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: "rgba(255,255,255,0.4)", fontFamily: "'DM Mono', monospace" }}>
-          Nombre del candidato
+          {t.candidateName}
         </label>
         <input
           value={name}
           onChange={e => setName(e.target.value)}
-          placeholder="Ej: Maria Garcia Lopez"
+          placeholder={t.candidateNamePlaceholder}
           style={{
             width: "100%", marginTop: 4, marginBottom: 14, padding: "10px 12px",
             background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)",
@@ -860,7 +1728,7 @@ function AddCandidateModal({ onAdd, onClose }) {
             color: mode === "paste" ? "#A5B4FC" : "rgba(255,255,255,0.4)",
             fontFamily: "'DM Sans', sans-serif",
           }}>
-            Pegar texto
+            {t.pasteText}
           </button>
           <button onClick={() => setMode("file")} style={{
             padding: "5px 14px", borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: "pointer",
@@ -869,19 +1737,19 @@ function AddCandidateModal({ onAdd, onClose }) {
             color: mode === "file" ? "#A5B4FC" : "rgba(255,255,255,0.4)",
             fontFamily: "'DM Sans', sans-serif",
           }}>
-            Subir archivo .txt
+            {t.uploadFilePdf}
           </button>
         </div>
 
         {mode === "paste" ? (
           <>
             <label style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: "rgba(255,255,255,0.4)", fontFamily: "'DM Mono', monospace" }}>
-              Texto del CV
+              {t.cvText}
             </label>
             <textarea
               value={cvText}
               onChange={e => setCvText(e.target.value)}
-              placeholder={"Pega aqui el contenido del CV...\n\nEj:\nIngeniero en Software | 5 anos de experiencia\nStack: React, Python, AWS...\nEducacion: Licenciatura en...\nIdiomas: Ingles C1..."}
+              placeholder={t.cvPlaceholder}
               rows={10}
               style={{
                 width: "100%", marginTop: 4, padding: "10px 12px",
@@ -897,20 +1765,23 @@ function AddCandidateModal({ onAdd, onClose }) {
             background: "rgba(255,255,255,0.03)", border: "2px dashed rgba(255,255,255,0.1)",
             borderRadius: 8, cursor: "pointer",
           }} onClick={() => fileRef.current?.click()}>
-            <input ref={fileRef} type="file" accept=".txt,.text" onChange={handleFileUpload} style={{ display: "none" }} />
+            <input ref={fileRef} type="file" accept=".txt,.text,.pdf" onChange={handleFileUpload} style={{ display: "none" }} />
             <p style={{ margin: 0, fontSize: 13, color: "rgba(255,255,255,0.4)" }}>
-              {cvText ? `Archivo cargado (${cvText.length} caracteres)` : "Haz clic para seleccionar un archivo .txt"}
+              {cvText ? t.fileLoaded(cvText.length) : t.clickToSelect}
+            </p>
+            <p style={{ margin: "6px 0 0", fontSize: 10, color: "rgba(255,255,255,0.25)", fontStyle: "italic" }}>
+              {t.pdfNote}
             </p>
             {cvText && (
               <p style={{ margin: "6px 0 0", fontSize: 11, color: "#818CF8" }}>
-                Vista previa: {cvText.substring(0, 80)}...
+                {t.preview}: {cvText.substring(0, 80)}...
               </p>
             )}
           </div>
         )}
 
         <p style={{ margin: "6px 0 0", fontSize: 10, color: cvText.trim().length >= 50 ? "rgba(255,255,255,0.3)" : "#EF4444", fontFamily: "'DM Mono', monospace" }}>
-          {cvText.trim().length}/50 caracteres minimo
+          {t.minCharsCV(cvText.trim().length)}
         </p>
 
         {/* Buttons */}
@@ -920,7 +1791,7 @@ function AddCandidateModal({ onAdd, onClose }) {
             background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)",
             color: "rgba(255,255,255,0.5)", fontFamily: "'DM Sans', sans-serif",
           }}>
-            Cancelar
+            {t.cancel}
           </button>
           <button onClick={handleSubmit} disabled={!isValid} style={{
             padding: "10px 20px", borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: isValid ? "pointer" : "default",
@@ -929,7 +1800,7 @@ function AddCandidateModal({ onAdd, onClose }) {
             color: isValid ? "#fff" : "#6B7280", fontFamily: "'DM Sans', sans-serif",
             boxShadow: isValid ? "0 0 16px rgba(99,102,241,0.4)" : "none",
           }}>
-            Agregar candidato
+            {t.addCandidateBtn}
           </button>
         </div>
       </div>
@@ -938,7 +1809,7 @@ function AddCandidateModal({ onAdd, onClose }) {
 }
 
 // ─── COMPARATIVE ANALYSIS PANEL ─────────────────────────────────────────────
-function ComparativePanel({ analysis }) {
+function ComparativePanel({ analysis, t }) {
   if (!analysis) return null;
 
   return (
@@ -948,13 +1819,13 @@ function ComparativePanel({ analysis }) {
       borderRadius: 12, animation: "fadeUp 0.4s ease",
     }}>
       <p style={{ margin: "0 0 14px", fontSize: 11, fontWeight: 700, color: "#818CF8", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>
-        Analisis Comparativo &middot; {analysis.totalAnalyzed} candidatos
+        {t.comparativeAnalysis} &middot; {analysis.totalAnalyzed} {t.candidates.toLowerCase()}
       </p>
 
       {/* Best candidate */}
       <div style={{ padding: 12, background: "rgba(16,185,129,0.06)", border: "1px solid rgba(16,185,129,0.15)", borderRadius: 8, marginBottom: 12 }}>
         <p style={{ margin: "0 0 4px", fontSize: 10, fontWeight: 700, color: "#10B981", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>
-          Mejor Candidato
+          {t.bestCandidate}
         </p>
         <p style={{ margin: 0, fontSize: 12, color: "#D1FAE5", lineHeight: 1.5 }}>
           {analysis.bestExplanation}
@@ -965,13 +1836,13 @@ function ComparativePanel({ analysis }) {
       {analysis.commonGaps.length > 0 && (
         <div style={{ padding: 12, background: "rgba(239,68,68,0.04)", border: "1px solid rgba(239,68,68,0.12)", borderRadius: 8, marginBottom: 12 }}>
           <p style={{ margin: "0 0 8px", fontSize: 10, fontWeight: 700, color: "#EF4444", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>
-            Brechas Comunes
+            {t.commonGaps}
           </p>
           {analysis.commonGaps.map((g, i) => (
             <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
               <span style={{ fontSize: 11, color: "#FEE2E2" }}>{g.skill}</span>
               <span style={{ fontSize: 10, color: "#EF4444", fontFamily: "'DM Mono', monospace" }}>
-                {g.count}/{analysis.totalAnalyzed} sin cubrir ({g.pct}%)
+                {t.uncovered(g.count, analysis.totalAnalyzed, g.pct)}
               </span>
             </div>
           ))}
@@ -982,7 +1853,7 @@ function ComparativePanel({ analysis }) {
       {analysis.heatmap.length > 0 && (
         <div style={{ padding: 12, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 8 }}>
           <p style={{ margin: "0 0 10px", fontSize: 10, fontWeight: 700, color: "rgba(255,255,255,0.5)", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>
-            Cobertura de Habilidades
+            {t.skillCoverage}
           </p>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
             {analysis.heatmap.map((h, i) => {
@@ -996,7 +1867,7 @@ function ComparativePanel({ analysis }) {
                   background: bg, border: `1px solid ${border2}`,
                   fontSize: 10, color: color2, fontFamily: "'DM Mono', monospace",
                   display: "flex", alignItems: "center", gap: 6,
-                }} title={h.candidates.length > 0 ? `Cubierto por: ${h.candidates.join(", ")}` : "Sin cobertura"}>
+                }} title={h.candidates.length > 0 ? `${t.coveredBy}: ${h.candidates.join(", ")}` : t.noCoverage}>
                   <span>{h.skill}</span>
                   <span style={{ fontWeight: 800 }}>{h.covered}/{analysis.totalAnalyzed}</span>
                 </div>
@@ -1009,13 +1880,115 @@ function ComparativePanel({ analysis }) {
   );
 }
 
+// ─── ANALYTICS PANEL ──────────────────────────────────────────────────────────
+function AnalyticsPanel({ results, candidates, t }) {
+  const analyzed = candidates.filter(c => results[c.id]);
+  if (analyzed.length < 2) return null;
+
+  const scores = analyzed.map(c => results[c.id].score);
+  const avg = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
+
+  // Score distribution
+  const dist = { "0-40": 0, "40-60": 0, "60-80": 0, "80-100": 0 };
+  for (const s of scores) {
+    if (s < 40) dist["0-40"]++;
+    else if (s < 60) dist["40-60"]++;
+    else if (s < 80) dist["60-80"]++;
+    else dist["80-100"]++;
+  }
+  const maxDist = Math.max(...Object.values(dist), 1);
+
+  // Common missing skills
+  const gapCounts = {};
+  for (const c of analyzed) {
+    const r = results[c.id];
+    if (r.unmatched_keywords) {
+      for (const gap of r.unmatched_keywords) {
+        const display = SKILLS_DISPLAY[gap] || gap;
+        gapCounts[display] = (gapCounts[display] || 0) + 1;
+      }
+    }
+  }
+  const topGaps = Object.entries(gapCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+
+  // Total analysis time
+  const totalTime = analyzed.reduce((sum, c) => sum + (results[c.id].analysisTime || 0), 0);
+
+  const distColors = { "0-40": "#EF4444", "40-60": "#F59E0B", "60-80": "#818CF8", "80-100": "#10B981" };
+  const distLabels = { "0-40": t.range0_40, "40-60": t.range40_60, "60-80": t.range60_80, "80-100": t.range80_100 };
+
+  return (
+    <div style={{
+      marginTop: 16, padding: 18,
+      background: "rgba(245,158,11,0.04)", border: "1px solid rgba(245,158,11,0.15)",
+      borderRadius: 12, animation: "fadeUp 0.4s ease",
+    }}>
+      <p style={{ margin: "0 0 14px", fontSize: 11, fontWeight: 700, color: "#F59E0B", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>
+        {t.analyticsTitle}
+      </p>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        {/* Score Distribution */}
+        <div style={{ padding: 12, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 8 }}>
+          <p style={{ margin: "0 0 10px", fontSize: 10, fontWeight: 700, color: "rgba(255,255,255,0.5)", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>
+            {t.scoreDistribution}
+          </p>
+          {Object.entries(dist).map(([range, count]) => (
+            <div key={range} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+              <span style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", fontFamily: "'DM Mono', monospace", width: 36, textAlign: "right" }}>
+                {distLabels[range]}
+              </span>
+              <div style={{ flex: 1, height: 14, background: "rgba(255,255,255,0.03)", borderRadius: 3, overflow: "hidden" }}>
+                <div style={{
+                  width: `${(count / maxDist) * 100}%`, height: "100%",
+                  background: distColors[range], borderRadius: 3,
+                  transition: "width 0.6s ease",
+                  minWidth: count > 0 ? 4 : 0,
+                }} />
+              </div>
+              <span style={{ fontSize: 10, color: distColors[range], fontFamily: "'DM Mono', monospace", width: 16, fontWeight: 700 }}>
+                {count}
+              </span>
+            </div>
+          ))}
+          <div style={{ marginTop: 8, textAlign: "center" }}>
+            <span style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", fontFamily: "'DM Mono', monospace" }}>{t.avgScoreLabel}: </span>
+            <span style={{ fontSize: 14, fontWeight: 800, color: avg >= 80 ? "#10B981" : avg >= 60 ? "#F59E0B" : "#EF4444", fontFamily: "'DM Mono', monospace" }}>{avg}</span>
+          </div>
+        </div>
+
+        {/* Missing Skills + Time */}
+        <div style={{ padding: 12, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 8 }}>
+          <p style={{ margin: "0 0 10px", fontSize: 10, fontWeight: 700, color: "rgba(255,255,255,0.5)", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>
+            {t.commonMissingSkills}
+          </p>
+          {topGaps.length > 0 ? topGaps.map(([skill, count], i) => (
+            <div key={i} style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+              <span style={{ fontSize: 11, color: "#FEE2E2" }}>{skill}</span>
+              <span style={{ fontSize: 10, color: "#EF4444", fontFamily: "'DM Mono', monospace" }}>{count}/{analyzed.length}</span>
+            </div>
+          )) : (
+            <p style={{ margin: 0, fontSize: 11, color: "rgba(255,255,255,0.3)", fontStyle: "italic" }}>--</p>
+          )}
+          {totalTime > 0 && (
+            <div style={{ marginTop: 10, paddingTop: 8, borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+              <span style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", fontFamily: "'DM Mono', monospace" }}>{t.totalAnalysisTime}: </span>
+              <span style={{ fontSize: 11, fontWeight: 700, color: "#818CF8", fontFamily: "'DM Mono', monospace" }}>{(totalTime / 1000).toFixed(1)}s</span>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── GENERATE TEXT REPORT ─────────────────────────────────────────────────────
-function generateReport(candidates, results, jobDesc) {
+function generateReport(candidates, results, jobDesc, t) {
   const lines = [];
-  lines.push("=== REPORTE DE ANALISIS DE CVs -- HRScout AI ===");
-  lines.push(`Fecha: ${new Date().toLocaleDateString("es-MX")}`);
+  lines.push(t.reportTitle);
+  lines.push(`${t.reportDate}: ${new Date().toLocaleDateString("es-MX")}`);
   lines.push("");
-  lines.push("DESCRIPCION DEL PUESTO:");
+  lines.push(t.reportJobDesc);
   lines.push(jobDesc);
   lines.push("");
   lines.push("-".repeat(60));
@@ -1026,10 +1999,15 @@ function generateReport(candidates, results, jobDesc) {
 
   sorted.forEach((c, i) => {
     const r = results[c.id];
-    const label = r.score >= 80 ? "APTO" : r.score >= 60 ? "REVISAR" : "NO APTO";
+    const label = r.score >= 80 ? t.reportSuitable : r.score >= 60 ? t.reportReview : t.reportNotSuitable;
     lines.push("");
     lines.push(`#${i + 1} -- ${c.name} [Score: ${r.score}/100 -- ${label}]`);
     lines.push(`   Titulo: ${r.titulo} | Experiencia: ${r.experiencia_anos} anos`);
+    lines.push(`   Modo de analisis: ${r.analysisMode === "tool_use" ? "Claude Tool Use (Agentic)" : r.analysisMode === "ai" ? "Claude AI" : "Local (keywords)"}`);
+    if (r.analysisMode === "ai" || r.analysisMode === "tool_use") {
+      lines.push(`   AI Score: ${r.aiScore} | Keyword Score: ${r.localScore} | Final: ${r.score}`);
+      lines.push(`   Confianza: ${r.confidence}${r.analysisMode === "tool_use" ? ` | Tool calls: ${r.toolCallCount || 0}` : ""}`);
+    }
     lines.push(`   Habilidades: ${r.habilidades_clave?.join(", ")}`);
     lines.push(`   Fortalezas: ${r.fortalezas?.join("; ")}`);
     lines.push(`   Brechas: ${r.brechas?.join("; ")}`);
@@ -1043,13 +2021,13 @@ function generateReport(candidates, results, jobDesc) {
   const aptos = sorted.filter(c => results[c.id].score >= 80).length;
   const revisar = sorted.filter(c => results[c.id].score >= 60 && results[c.id].score < 80).length;
   const noAptos = sorted.filter(c => results[c.id].score < 60).length;
-  lines.push(`RESUMEN: ${sorted.length} analizados | ${aptos} aptos | ${revisar} revisar | ${noAptos} no aptos`);
+  lines.push(t.reportSummary(sorted.length, aptos, revisar, noAptos));
 
   return lines.join("\n");
 }
 
 // ─── APP ──────────────────────────────────────────────────────────────────────
-function ContactBar() {
+function ContactBar({ t }) {
   const [show, setShow] = useState(false);
   const [dismissed, setDismissed] = useState(false);
   useEffect(() => {
@@ -1062,9 +2040,9 @@ function ContactBar() {
   return (
     <div style={{ position: 'fixed', bottom: 0, left: 0, right: 0, zIndex: 9999, background: 'rgba(10,11,15,0.95)', backdropFilter: 'blur(12px)', borderTop: '1px solid rgba(99,102,241,0.2)', padding: '12px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap', animation: 'slideUpCTA 0.4s ease', fontFamily: "'DM Sans', sans-serif" }}>
       <style>{`@keyframes slideUpCTA { from { transform: translateY(100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }`}</style>
-      <span style={{ color: '#E2E8F0', fontSize: 14, fontWeight: 500 }}>Esto es una demo gratuita de Impulso IA 👋 ¿Quieres algo así para tu negocio?</span>
+      <span style={{ color: '#E2E8F0', fontSize: 14, fontWeight: 500 }}>{t.ctaText}</span>
       <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-        <a href="https://impulso-ia-navy.vercel.app/#contacto" target="_blank" rel="noopener noreferrer" style={{ padding: '8px 18px', borderRadius: 8, background: 'linear-gradient(135deg, #6366F1, #4F46E5)', color: '#fff', fontSize: 13, fontWeight: 600, textDecoration: 'none', transition: 'transform 0.2s' }}>Platiquemos</a>
+        <a href="https://impulso-ia-navy.vercel.app/#contacto" target="_blank" rel="noopener noreferrer" style={{ padding: '8px 18px', borderRadius: 8, background: 'linear-gradient(135deg, #6366F1, #4F46E5)', color: '#fff', fontSize: 13, fontWeight: 600, textDecoration: 'none', transition: 'transform 0.2s' }}>{t.ctaButton}</a>
         <a href="https://wa.me/525579605324?text=Hola%20Christian%2C%20me%20interesa%20saber%20m%C3%A1s%20sobre%20tus%20servicios%20de%20IA" target="_blank" rel="noopener noreferrer" style={{ padding: '8px 18px', borderRadius: 8, background: 'rgba(37,211,102,0.15)', border: '1px solid rgba(37,211,102,0.3)', color: '#25D366', fontSize: 13, fontWeight: 600, textDecoration: 'none' }}>WhatsApp</a>
         <button onClick={dismiss} style={{ background: 'none', border: 'none', color: '#64748B', fontSize: 18, cursor: 'pointer', padding: '4px 8px' }}>✕</button>
       </div>
@@ -1073,7 +2051,14 @@ function ContactBar() {
 }
 
 export default function CVScreener() {
-  const [jobDesc, setJobDesc] = useState(`Especialista en IA & Automatizacion
+  const [lang, setLang] = useState("es");
+  const t = TRANSLATIONS[lang];
+
+  // Load saved state from localStorage
+  const savedJobDesc = (() => { try { return localStorage.getItem("hrscout_jobDesc"); } catch { return null; } })();
+  const savedResults = (() => { try { const r = localStorage.getItem("hrscout_results"); return r ? JSON.parse(r) : null; } catch { return null; } })();
+
+  const [jobDesc, setJobDesc] = useState(savedJobDesc || `Especialista en IA & Automatizacion
 Buscamos profesional con experiencia en:
 - Implementacion de agentes IA y workflows automatizados (Make.com, n8n, Zapier)
 - Prompt engineering avanzado con Claude, GPT-4o y Gemini
@@ -1084,9 +2069,9 @@ Buscamos profesional con experiencia en:
 Indispensable: experiencia con LLMs, automatizacion de procesos
 Deseable: experiencia en startups, certificaciones en IA, portafolio de proyectos.`);
 
-  const [presetKey, setPresetKey] = useState("Especialista en IA");
+  const [presetKey, setPresetKey] = useState(savedJobDesc ? "" : "Especialista en IA");
   const [candidates, setCandidates] = useState(SAMPLE_CVS);
-  const [results, setResults] = useState({});
+  const [results, setResults] = useState(savedResults || {});
   const [analyzingId, setAnalyzingId] = useState(null);
   const [analyzingAll, setAnalyzingAll] = useState(false);
   const [ranked, setRanked] = useState([]);
@@ -1095,10 +2080,50 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
   const [showAddModal, setShowAddModal] = useState(false);
   const [nextId, setNextId] = useState(100);
   const [comparativeAnalysis, setComparativeAnalysis] = useState(null);
+  const [apiKey, setApiKey] = useState(() => { try { return localStorage.getItem("hrscout_apiKey") || ""; } catch { return ""; } });
+  const [showApiKeyInput, setShowApiKeyInput] = useState(false);
+  const [tourStep, setTourStep] = useState(0);
+  const [tourActive, setTourActive] = useState(true);
   const cardRefs = useRef({});
 
   const isJobDescValid = jobDesc.trim().length >= 20;
   const customIds = useRef(new Set());
+
+  // Persist results to localStorage
+  useEffect(() => {
+    try { localStorage.setItem("hrscout_results", JSON.stringify(results)); } catch {}
+  }, [results]);
+
+  // Persist jobDesc to localStorage
+  useEffect(() => {
+    try { localStorage.setItem("hrscout_jobDesc", jobDesc); } catch {}
+  }, [jobDesc]);
+
+  // Persist API key
+  useEffect(() => {
+    try { if (apiKey) localStorage.setItem("hrscout_apiKey", apiKey); else localStorage.removeItem("hrscout_apiKey"); } catch {}
+  }, [apiKey]);
+
+  // Restore rankings from saved results on mount
+  useEffect(() => {
+    if (savedResults && Object.keys(savedResults).length > 0) {
+      const comp = generateComparativeAnalysis(candidates, savedResults, jobDesc);
+      setComparativeAnalysis(comp);
+      const newRanked = candidates
+        .filter(c => savedResults[c.id])
+        .sort((a, b) => (savedResults[b.id]?.score || 0) - (savedResults[a.id]?.score || 0));
+      setRanked(newRanked.map(c => c.id));
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const clearResults = () => {
+    if (!window.confirm(t.clearConfirm)) return;
+    setResults({});
+    setRanked([]);
+    setComparativeAnalysis(null);
+    try { localStorage.removeItem("hrscout_results"); } catch {}
+  };
 
   const handlePresetChange = (key) => {
     setPresetKey(key);
@@ -1145,10 +2170,13 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
       ref.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
 
-    // Simulate brief processing delay for UX
-    await new Promise(r => setTimeout(r, 800 + Math.random() * 600));
+    const localResult = analyzeCV(candidate.cv, jobDesc);
 
-    const parsed = analyzeCV(candidate.cv, jobDesc);
+    // Try tool use first (agentic), fall back to simple Claude, then local
+    let parsed = await analyzeWithToolUse(candidate.cv, jobDesc, localResult, apiKey);
+    if (!parsed) {
+      parsed = await analyzeCVWithClaude(candidate.cv, jobDesc, localResult, apiKey);
+    }
 
     setResults(prev => {
       const updated = { ...prev, [candidate.id]: parsed };
@@ -1156,7 +2184,7 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
       return updated;
     });
     setAnalyzingId(null);
-  }, [analyzingId, candidates, jobDesc, updateRankings]);
+  }, [analyzingId, candidates, jobDesc, updateRankings, apiKey]);
 
   const analyzeAll = async () => {
     if (!isJobDescValid) return;
@@ -1165,7 +2193,7 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
 
     for (let i = 0; i < candidates.length; i++) {
       const c = candidates[i];
-      setProgressText(`Analizando ${i + 1}/${candidates.length} -- ${c.name}...`);
+      setProgressText(t.analyzingName(i + 1, candidates.length, c.name));
       setAnalyzingId(c.id);
 
       const ref = cardRefs.current[c.id];
@@ -1173,9 +2201,11 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
         ref.scrollIntoView({ behavior: "smooth", block: "nearest" });
       }
 
-      await new Promise(r => setTimeout(r, 800 + Math.random() * 600));
-
-      const parsed = analyzeCV(c.cv, jobDesc);
+      const localResult = analyzeCV(c.cv, jobDesc);
+      let parsed = await analyzeWithToolUse(c.cv, jobDesc, localResult, apiKey);
+      if (!parsed) {
+        parsed = await analyzeCVWithClaude(c.cv, jobDesc, localResult, apiKey);
+      }
       allResults[c.id] = parsed;
 
       setResults(prev => {
@@ -1220,7 +2250,7 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
     : 0;
 
   const downloadReport = () => {
-    const text = generateReport(candidates, results, jobDesc);
+    const text = generateReport(candidates, results, jobDesc, t);
     const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1230,8 +2260,69 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
     URL.revokeObjectURL(url);
   };
 
+  const handleTourNext = useCallback(async () => {
+    const nextStep = tourStep + 1;
+    const currentStep = TOUR_STEPS[tourStep];
+
+    if (currentStep?.action === "selectPreset") {
+      // Auto-select "Especialista en IA" preset
+      setPresetKey("Especialista en IA");
+      setJobDesc(PRESET_JOBS["Especialista en IA"]);
+    }
+
+    if (currentStep?.action === "analyzeAll") {
+      // Auto-trigger analysis
+      const currentJobDesc = PRESET_JOBS["Especialista en IA"] || jobDesc;
+      if (currentJobDesc.trim().length >= 20) {
+        setTourStep(nextStep);
+        setAnalyzingAll(true);
+        const allRes = {};
+        for (let i = 0; i < candidates.length; i++) {
+          const c = candidates[i];
+          setProgressText(t.analyzingName(i + 1, candidates.length, c.name));
+          setAnalyzingId(c.id);
+          const ref = cardRefs.current[c.id];
+          if (ref) ref.scrollIntoView({ behavior: "smooth", block: "nearest" });
+          const localResult = analyzeCV(c.cv, currentJobDesc);
+          allRes[c.id] = { ...localResult, analysisMode: "local" };
+          setResults(prev => {
+            const updated = { ...prev, [c.id]: allRes[c.id] };
+            updateRankings(updated, candidates);
+            return updated;
+          });
+          await new Promise(r => setTimeout(r, 150));
+        }
+        setAnalyzingId(null);
+        setAnalyzingAll(false);
+        setProgressText("");
+        return; // Already advanced step
+      }
+    }
+
+    if (nextStep >= TOUR_STEPS.length) {
+      setTourActive(false);
+      return;
+    }
+    setTourStep(nextStep);
+  }, [tourStep, candidates, jobDesc, t, updateRankings]);
+
+  const handleTourSkip = useCallback(() => {
+    setTourActive(false);
+  }, []);
+
   return (
     <>
+    {/* Tour Overlay */}
+    <TourOverlay
+      tourStep={tourStep}
+      tourActive={tourActive}
+      lang={lang}
+      setLang={setLang}
+      onNext={handleTourNext}
+      onSkip={handleTourSkip}
+      totalSteps={TOUR_STEPS.length}
+    />
+
     <div style={{ minHeight: "100vh", background: "#0A0B0F", fontFamily: "'DM Sans', sans-serif", padding: "20px 16px" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&family=Cabinet+Grotesk:wght@700;800&display=swap');
@@ -1248,6 +2339,7 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
         <AddCandidateModal
           onAdd={handleAddCandidate}
           onClose={() => setShowAddModal(false)}
+          t={t}
         />
       )}
 
@@ -1266,16 +2358,50 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
               <span style={{ fontSize: 13, fontWeight: 500, color: "#6366F1", marginLeft: 10, verticalAlign: "middle", border: "1px solid #4F46E5", borderRadius: 5, padding: "2px 8px" }}>AI</span>
             </h1>
             <p style={{ margin: 0, fontSize: 12, color: "rgba(255,255,255,0.3)", fontFamily: "'DM Mono', monospace" }}>
-              Filtrado y ranking de CVs con IA &middot; Analisis real de competencias &middot; RRHH automatizado
+              {t.subtitle}
             </p>
           </div>
 
-          {/* Stats */}
-          <div style={{ display: "flex", gap: 10 }}>
+          {/* Lang toggle + Stats */}
+          <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+            <div style={{
+              display: "flex",
+              background: "rgba(255,255,255,0.04)",
+              border: "1px solid rgba(255,255,255,0.08)",
+              borderRadius: 8,
+              overflow: "hidden",
+              height: 34,
+              alignSelf: "center",
+            }}>
+              {["ES", "EN"].map((code) => {
+                const isActive = lang === code.toLowerCase();
+                return (
+                  <button
+                    key={code}
+                    onClick={() => setLang(code.toLowerCase())}
+                    style={{
+                      padding: "0 12px",
+                      background: isActive ? "rgba(99,102,241,0.18)" : "transparent",
+                      border: "none",
+                      cursor: "pointer",
+                      fontSize: 12,
+                      fontWeight: isActive ? 700 : 400,
+                      color: isActive ? "#818CF8" : "rgba(255,255,255,0.35)",
+                      fontFamily: "'DM Mono', monospace",
+                      letterSpacing: "0.05em",
+                      transition: "all 0.15s",
+                      borderRight: code === "ES" ? "1px solid rgba(255,255,255,0.08)" : "none",
+                    }}
+                  >
+                    {code}
+                  </button>
+                );
+              })}
+            </div>
             {[
-              { label: "Analizados", value: `${analyzed}/${candidates.length}` },
-              { label: "Aptos", value: aptos, color: "#10B981" },
-              { label: "Score Prom.", value: analyzed > 0 ? avgScore : "--", color: "#818CF8" },
+              { label: t.analyzed, value: `${analyzed}/${candidates.length}` },
+              { label: t.suitable, value: aptos, color: "#10B981" },
+              { label: t.avgScore, value: analyzed > 0 ? avgScore : "--", color: "#818CF8" },
             ].map((s, i) => (
               <div key={i} style={{
                 background: "rgba(255,255,255,0.03)",
@@ -1292,15 +2418,16 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
         <div style={{ display: "grid", gridTemplateColumns: "320px 1fr", gap: 20 }}>
 
           {/* PANEL IZQUIERDO -- JOB DESC */}
-          <div>
+          <div data-tour="job-desc">
             <div style={{ marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <label style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase", color: "rgba(255,255,255,0.4)", fontFamily: "'DM Mono', monospace" }}>
-                Descripcion del Puesto
+                {t.jobDesc}
               </label>
             </div>
 
             {/* Preset dropdown */}
             <select
+              data-tour="preset-select"
               value={presetKey}
               onChange={e => handlePresetChange(e.target.value)}
               style={{
@@ -1311,7 +2438,7 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
                 appearance: "auto",
               }}
             >
-              <option value="" style={{ background: "#1a1b26", color: "#A5B4FC" }}>-- Seleccionar preset --</option>
+              <option value="" style={{ background: "#1a1b26", color: "#A5B4FC" }}>{t.selectPreset}</option>
               {Object.keys(PRESET_JOBS).filter(k => k !== "").map(key => (
                 <option key={key} value={key} style={{ background: "#1a1b26", color: "#D1D5DB" }}>{key}</option>
               ))}
@@ -1332,7 +2459,7 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
             />
             {!isJobDescValid && (
               <p style={{ margin: "6px 0 0", fontSize: 11, color: "#EF4444", fontFamily: "'DM Mono', monospace" }}>
-                Minimo 20 caracteres para iniciar el analisis ({jobDesc.trim().length}/20)
+                {t.minChars(jobDesc.trim().length)}
               </p>
             )}
 
@@ -1353,29 +2480,123 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
               {analyzingAll ? (
                 <>
                   <div style={{ width: 14, height: 14, borderRadius: "50%", border: "2px solid rgba(255,255,255,0.2)", borderTop: "2px solid #6366F1", animation: "spin 1s linear infinite" }} />
-                  {progressText || `Analizando...`}
+                  {progressText || t.analyzing}
                 </>
-              ) : allAnalyzed ? "Re-analizar todos" : "Analizar todos los CVs"}
+              ) : allAnalyzed ? t.reAnalyzeAll : t.analyzeAll}
             </button>
+
+            {/* API Key Input */}
+            <div style={{ marginTop: 10, padding: 10, background: "rgba(99,102,241,0.04)", border: "1px solid rgba(99,102,241,0.12)", borderRadius: 8 }}>
+              {!showApiKeyInput && !apiKey ? (
+                <button onClick={() => setShowApiKeyInput(true)} style={{
+                  width: "100%", padding: "8px", borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: "pointer",
+                  background: "rgba(99,102,241,0.1)", border: "1px solid rgba(99,102,241,0.25)", color: "#A5B4FC",
+                  fontFamily: "'DM Mono', monospace",
+                }}>
+                  {t.apiKeyLabel}
+                </button>
+              ) : apiKey ? (
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: 10, color: "#10B981", fontFamily: "'DM Mono', monospace" }}>
+                    &#10003; {t.apiKeySet}
+                  </span>
+                  <button onClick={() => { setApiKey(""); setShowApiKeyInput(false); }} style={{
+                    padding: "3px 8px", borderRadius: 4, fontSize: 10, cursor: "pointer",
+                    background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.2)", color: "#EF4444",
+                    fontFamily: "'DM Mono', monospace",
+                  }}>
+                    {t.apiKeyRemove}
+                  </button>
+                </div>
+              ) : (
+                <div>
+                  <input
+                    type="password"
+                    placeholder={t.apiKeyPlaceholder}
+                    value={apiKey}
+                    onChange={e => setApiKey(e.target.value)}
+                    style={{
+                      width: "100%", padding: "8px 10px", borderRadius: 6, fontSize: 11,
+                      background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)",
+                      color: "#D1D5DB", fontFamily: "'DM Mono', monospace", outline: "none",
+                    }}
+                    onKeyDown={e => { if (e.key === "Escape") setShowApiKeyInput(false); }}
+                  />
+                  <p style={{ margin: "4px 0 0", fontSize: 9, color: "rgba(255,255,255,0.25)", fontStyle: "italic" }}>
+                    {t.apiKeyLabel}
+                  </p>
+                </div>
+              )}
+            </div>
 
             {/* Download report button */}
             {analyzed > 0 && (
+              <div data-tour="export-area" style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                <button
+                  onClick={downloadReport}
+                  style={{
+                    flex: 1, padding: "11px",
+                    background: "rgba(16,185,129,0.1)",
+                    border: "1px solid rgba(16,185,129,0.25)",
+                    borderRadius: 10,
+                    fontSize: 12, fontWeight: 700, color: "#10B981",
+                    cursor: "pointer",
+                    fontFamily: "'DM Sans', sans-serif",
+                    transition: "all 0.2s",
+                  }}
+                  onMouseEnter={e => { e.currentTarget.style.background = "rgba(16,185,129,0.18)"; }}
+                  onMouseLeave={e => { e.currentTarget.style.background = "rgba(16,185,129,0.1)"; }}
+                >
+                  {t.downloadReport}
+                </button>
+                <button
+                  onClick={() => {
+                    const sorted = [...candidates].filter(c => results[c.id]).sort((a, b) => (results[b.id]?.score || 0) - (results[a.id]?.score || 0));
+                    const data = sorted.map(c => ({ name: c.name, ...results[c.id] }));
+                    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `hrscout-${new Date().toISOString().slice(0, 10)}.json`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                  style={{
+                    padding: "11px 14px",
+                    background: "rgba(99,102,241,0.1)",
+                    border: "1px solid rgba(99,102,241,0.25)",
+                    borderRadius: 10,
+                    fontSize: 12, fontWeight: 700, color: "#818CF8",
+                    cursor: "pointer",
+                    fontFamily: "'DM Sans', sans-serif",
+                    transition: "all 0.2s",
+                  }}
+                  onMouseEnter={e => { e.currentTarget.style.background = "rgba(99,102,241,0.18)"; }}
+                  onMouseLeave={e => { e.currentTarget.style.background = "rgba(99,102,241,0.1)"; }}
+                >
+                  {t.exportJSON}
+                </button>
+              </div>
+            )}
+
+            {/* Clear results */}
+            {analyzed > 0 && (
               <button
-                onClick={downloadReport}
+                onClick={clearResults}
                 style={{
-                  width: "100%", marginTop: 8, padding: "11px",
-                  background: "rgba(16,185,129,0.1)",
-                  border: "1px solid rgba(16,185,129,0.25)",
+                  width: "100%", marginTop: 6, padding: "9px",
+                  background: "rgba(239,68,68,0.06)",
+                  border: "1px solid rgba(239,68,68,0.15)",
                   borderRadius: 10,
-                  fontSize: 12, fontWeight: 700, color: "#10B981",
+                  fontSize: 11, fontWeight: 600, color: "#EF4444",
                   cursor: "pointer",
                   fontFamily: "'DM Sans', sans-serif",
                   transition: "all 0.2s",
                 }}
-                onMouseEnter={e => { e.currentTarget.style.background = "rgba(16,185,129,0.18)"; }}
-                onMouseLeave={e => { e.currentTarget.style.background = "rgba(16,185,129,0.1)"; }}
+                onMouseEnter={e => { e.currentTarget.style.background = "rgba(239,68,68,0.12)"; }}
+                onMouseLeave={e => { e.currentTarget.style.background = "rgba(239,68,68,0.06)"; }}
               >
-                Descargar reporte
+                {t.clearResults}
               </button>
             )}
 
@@ -1386,13 +2607,13 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
                 border: "1px solid rgba(99,102,241,0.15)",
                 borderRadius: 8, animation: "fadeUp 0.3s ease",
               }}>
-                <p style={{ margin: "0 0 8px", fontSize: 10, fontWeight: 700, color: "#818CF8", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>Resumen del Proceso</p>
+                <p style={{ margin: "0 0 8px", fontSize: 10, fontWeight: 700, color: "#818CF8", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>{t.processSummary}</p>
                 <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                   {[
-                    { label: "Total candidatos", value: candidates.length },
-                    { label: "Aptos (>=80)", value: aptos, color: "#10B981" },
-                    { label: "Revisar (60-79)", value: Object.values(results).filter(r => r.score >= 60 && r.score < 80).length, color: "#F59E0B" },
-                    { label: "No aptos (<60)", value: Object.values(results).filter(r => r.score < 60).length, color: "#EF4444" },
+                    { label: t.totalCandidates, value: candidates.length },
+                    { label: t.suitableGte80, value: aptos, color: "#10B981" },
+                    { label: t.reviewRange, value: Object.values(results).filter(r => r.score >= 60 && r.score < 80).length, color: "#F59E0B" },
+                    { label: t.notSuitableLt60, value: Object.values(results).filter(r => r.score < 60).length, color: "#EF4444" },
                   ].map((item, i) => (
                     <div key={i} style={{ display: "flex", justifyContent: "space-between" }}>
                       <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>{item.label}</span>
@@ -1405,15 +2626,15 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
           </div>
 
           {/* PANEL DERECHO -- CANDIDATOS */}
-          <div>
+          <div data-tour="candidates">
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
               <label style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase", color: "rgba(255,255,255,0.4)", fontFamily: "'DM Mono', monospace" }}>
-                Candidatos &middot; {ranked.length > 0 ? "Ordenados por compatibilidad" : "Sin analizar"}
+                {t.candidates} &middot; {ranked.length > 0 ? t.sortedByFit : t.unsorted}
               </label>
               <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                 {ranked.length > 0 && (
                   <span style={{ fontSize: 10, color: "#818CF8", fontFamily: "'DM Mono', monospace" }}>
-                    Top: {sortedCandidates[0]?.name}
+                    {t.top}: {sortedCandidates[0]?.name}
                   </span>
                 )}
                 <button
@@ -1430,7 +2651,7 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
                   onMouseEnter={e => { e.currentTarget.style.background = "rgba(245,158,11,0.22)"; }}
                   onMouseLeave={e => { e.currentTarget.style.background = "rgba(245,158,11,0.12)"; }}
                 >
-                  + Agregar candidato
+                  {t.addCandidate}
                 </button>
               </div>
             </div>
@@ -1439,10 +2660,10 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
             {analyzed > 0 && (
               <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
                 {[
-                  { id: "all", label: "Todos", color: "#818CF8" },
-                  { id: "apto", label: "Aptos", color: "#10B981" },
-                  { id: "revisar", label: "Revisar", color: "#F59E0B" },
-                  { id: "no_apto", label: "No aptos", color: "#EF4444" },
+                  { id: "all", label: t.filterAll, color: "#818CF8" },
+                  { id: "apto", label: t.filterSuitable, color: "#10B981" },
+                  { id: "revisar", label: t.filterReview, color: "#F59E0B" },
+                  { id: "no_apto", label: t.filterNotSuitable, color: "#EF4444" },
                 ].map(f => (
                   <button
                     key={f.id}
@@ -1466,37 +2687,42 @@ Deseable: experiencia en startups, certificaciones en IA, portafolio de proyecto
 
             <div style={{ maxHeight: "calc(100vh - 200px)", overflowY: "auto", paddingRight: 4 }}>
               {filteredCandidates.map((c, i) => (
-                <CandidateCard
-                  key={c.id}
-                  candidate={c}
-                  rank={i + 1}
-                  onAnalyze={analyzeCandidate}
-                  analyzing={analyzingId === c.id}
-                  globalAnalyzing={analyzingAll}
-                  result={results[c.id]}
-                  cardRef={el => { cardRefs.current[c.id] = el; }}
-                  onRemove={handleRemoveCandidate}
-                  isCustom={customIds.current.has(c.id)}
-                />
+                <div key={c.id} data-tour={i === 0 ? "candidate-0" : undefined}>
+                  <CandidateCard
+                    candidate={c}
+                    rank={i + 1}
+                    onAnalyze={analyzeCandidate}
+                    analyzing={analyzingId === c.id}
+                    globalAnalyzing={analyzingAll}
+                    result={results[c.id]}
+                    cardRef={el => { cardRefs.current[c.id] = el; }}
+                    onRemove={handleRemoveCandidate}
+                    isCustom={customIds.current.has(c.id)}
+                    t={t}
+                  />
+                </div>
               ))}
               {filteredCandidates.length === 0 && analyzed > 0 && (
                 <div style={{ textAlign: "center", padding: 40, color: "rgba(255,255,255,0.3)", fontSize: 13 }}>
-                  No hay candidatos en esta categoria
+                  {t.noCandidatesInCategory}
                 </div>
               )}
             </div>
 
             {/* Comparative Analysis */}
-            <ComparativePanel analysis={comparativeAnalysis} />
+            <ComparativePanel analysis={comparativeAnalysis} t={t} />
+
+            {/* Analytics Panel */}
+            <AnalyticsPanel results={results} candidates={candidates} t={t} />
           </div>
         </div>
 
         <p style={{ textAlign: "center", marginTop: 20, fontSize: 10, color: "rgba(255,255,255,0.1)", fontFamily: "'DM Mono', monospace", letterSpacing: "0.1em" }}>
-          HRSCOUT &middot; ANALISIS REAL DE CVs &middot; FILTRADO AUTOMATICO &middot; RANKING POR COMPATIBILIDAD
+          {t.footer}
         </p>
       </div>
     </div>
-    <ContactBar />
+    <ContactBar t={t} />
     </>
   );
 }
