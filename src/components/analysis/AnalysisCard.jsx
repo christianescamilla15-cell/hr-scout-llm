@@ -1,3 +1,4 @@
+import { apiUrl } from "../../api/client";
 import { TOKENS } from "../../constants/tokens";
 import { ScorePill } from "./ScorePill";
 
@@ -17,6 +18,7 @@ function List({ items, color }) {
 export function AnalysisCard({ analysis }) {
   if (!analysis) return null;
   const {
+    id,
     score,
     local_score,
     ai_score,
@@ -29,6 +31,8 @@ export function AnalysisCard({ analysis }) {
     analysis_mode,
     latency_ms,
   } = analysis;
+
+  const pdfHref = id ? apiUrl(`/api/analyses/${id}/report.pdf`) : null;
 
   return (
     <article
@@ -141,14 +145,37 @@ export function AnalysisCard({ analysis }) {
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
+          gap: TOKENS.space[3],
+          flexWrap: "wrap",
           fontSize: TOKENS.text.caption.size,
           color: TOKENS.color.textMuted,
         }}
       >
         <span>Próximo paso: {action}</span>
-        <span style={{ fontStyle: "italic" }}>
-          La decisión final de contratación es tuya.
-        </span>
+        <div style={{ display: "flex", alignItems: "center", gap: TOKENS.space[3] }}>
+          {pdfHref && (
+            <a
+              href={pdfHref}
+              target="_blank"
+              rel="noopener"
+              style={{
+                padding: `${TOKENS.space[1]} ${TOKENS.space[3]}`,
+                background: TOKENS.color.surfaceRaised,
+                border: `1px solid ${TOKENS.color.borderSubtle}`,
+                borderRadius: TOKENS.radius.sm,
+                color: TOKENS.color.textSecondary,
+                fontSize: TOKENS.text.caption.size,
+                textDecoration: "none",
+                fontWeight: 600,
+              }}
+            >
+              ↓ Descargar PDF
+            </a>
+          )}
+          <span style={{ fontStyle: "italic" }}>
+            La decisión final de contratación es tuya.
+          </span>
+        </div>
       </footer>
     </article>
   );

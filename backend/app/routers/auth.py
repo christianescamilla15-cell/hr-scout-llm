@@ -9,6 +9,7 @@ the Google flow because Christian's audience (reclutadoras MX) lives on
 Google Workspace.
 """
 
+import logging
 from datetime import UTC, datetime, timedelta
 from secrets import token_urlsafe
 
@@ -24,6 +25,9 @@ from app.auth.jwt_tokens import mint_session_token
 from app.config import get_settings
 from app.db.database import get_db
 from app.db.models import User
+from app.email import resend_client
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -137,6 +141,7 @@ async def google_callback(
     name = claims.get("name") or email.split("@")[0]
 
     # Upsert: prefer google_sub match, fall back to email match (account-linking).
+    is_new_user = False
     result = await db.execute(select(User).where(User.google_sub == google_sub))
     user = result.scalar_one_or_none()
     if user is None:
@@ -151,12 +156,26 @@ async def google_callback(
                 trial_ends_at=datetime.now(UTC) + timedelta(days=TRIAL_DURATION_DAYS),
             )
             db.add(user)
+            is_new_user = True
         else:
             user.google_sub = google_sub
             if not user.name:
                 user.name = name
     await db.commit()
     await db.refresh(user)
+
+    # Best-effort welcome email for brand-new users. Failures are logged but
+    # don't block the login redirect — the user shouldn't see "email service
+    # down" when they successfully signed in.
+    if is_new_user and resend_client.is_configured():
+        try:
+            await resend_client.send_welcome(
+                to=user.email,
+                name=user.name,
+                trial_ends_at_iso=user.trial_ends_at.isoformat() if user.trial_ends_at else None,
+            )
+        except resend_client.EmailError as exc:
+            log.warning("Welcome email failed for %s: %s", user.email, exc)
 
     token = mint_session_token(user.id, user.email, user.plan)
     settings = get_settings()
