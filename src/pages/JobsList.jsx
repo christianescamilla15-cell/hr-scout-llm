@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 
 import { ApiError, api } from "../api/client";
 import { TOKENS } from "../constants/tokens";
@@ -254,11 +255,15 @@ export function JobsListPage() {
                   style={{
                     fontSize: TOKENS.text.h3.size,
                     fontWeight: 600,
-                    color: TOKENS.color.textPrimary,
                     marginBottom: TOKENS.space[2],
                   }}
                 >
-                  {job.title}
+                  <Link
+                    to={`/jobs/${job.id}`}
+                    style={{ color: TOKENS.color.textPrimary, textDecoration: "none" }}
+                  >
+                    {job.title}
+                  </Link>
                 </h2>
                 <p
                   style={{

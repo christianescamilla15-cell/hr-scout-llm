@@ -5,6 +5,7 @@ import { AuthProvider } from "./auth/AuthContext";
 import { RequireAuth } from "./auth/RequireAuth";
 import { AppLayout } from "./components/layout/AppLayout";
 import { DashboardPage } from "./pages/Dashboard";
+import { JobDetailPage } from "./pages/JobDetail";
 import { JobsListPage } from "./pages/JobsList";
 import { LoginPage } from "./pages/Login";
 
@@ -44,6 +45,16 @@ export function Root() {
               <RequireAuth>
                 <AppLayout>
                   <JobsListPage />
+                </AppLayout>
+              </RequireAuth>
+            }
+          />
+          <Route
+            path="/jobs/:jobId"
+            element={
+              <RequireAuth>
+                <AppLayout>
+                  <JobDetailPage />
                 </AppLayout>
               </RequireAuth>
             }
