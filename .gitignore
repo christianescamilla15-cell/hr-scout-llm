@@ -67,6 +67,15 @@ __pycache__/
 venv/
 env/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local sqlite DBs (dev + smoke)
+*.db
+*.db-journal
+hrscout_*.db
 
 # Deployment
 .vercel/
