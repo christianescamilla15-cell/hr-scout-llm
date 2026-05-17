@@ -496,4 +496,42 @@ Day-10 launch is GO when:
 
 ---
 
+## 19. Decisions log (closed)
+
+All open items in §15 and the calibration-run copy questions are
+resolved. Agents and engineering must follow these as canonical.
+
+### From §15 (product/infra) — resolved 2026-05-17
+
+| # | Decision | Resolution |
+|---|---|---|
+| 1 | Overage on Individual plan | Hard block at 100 análisis/mo + prompt upgrade. No surprise charges. |
+| 2 | Domain name | `hrscout.mx` (target) |
+| 3 | Agency plan seats included | 3 seats |
+| 4 | Trial duration | 14 días |
+| 5 | Signup paths at launch | Google OAuth + email/password, both day 1 |
+| 6 | Annual discount | 2 meses gratis (~16% off) |
+| 7 | CTA color | Indigo (brand color) — keep |
+
+### From copy calibration run — resolved 2026-05-17
+
+| # | Decision | Resolution |
+|---|---|---|
+| C1 | Hero CTA wording | "Empieza gratis 14 días" (imperativo) |
+| C2 | 30-day money-back guarantee | **Defer to month 2.** Pre-launch sin churn data — risk of abuse on a $97/mo product. Re-evaluate once we have ≥10 paying customers. |
+| C3 | "Más popular" badge on Agency tier | **Yes.** Defendible internally: "tier que más recomendamos". Standard B2B anchoring. |
+| C4 | Social Proof section pre-testimonials | "Próximamente — primeros 20 usuarios" como invitación exclusiva. Reemplazar cuando haya 3 testimonios reales con foto+cargo+empresa. |
+| C5 | Founder name in footer + WhatsApp CTA | **Yes** — "Hablar con Christian". Founder-led venta en MX SMB convierte mejor. |
+
+### Open questions for the next session
+
+None blocking Phase 1 Day 1. The following are nice-to-have once the
+brand audit lands:
+
+- `docs/BRAND.md` to be written by `hr-scout-brand` agent (paleta
+  canonical, tipografía, tokens, voice & tone, do/don't)
+- A11y audit pre-launch (Lighthouse ≥ 90 mobile + desktop)
+
+---
+
 *Last updated: 2026-05-17 · Christian Hernandez*
