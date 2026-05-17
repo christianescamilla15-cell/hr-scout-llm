@@ -1,7 +1,6 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,6 +24,7 @@ class Settings(BaseSettings):
     google_client_id: str | None = None
     google_client_secret: str | None = None
     oauth_redirect_uri: str = "http://localhost:8004/api/auth/google/callback"
+    frontend_post_login_url: str = "http://localhost:3004/dashboard"
 
     anthropic_api_key: str | None = None
     groq_api_key: str | None = None
