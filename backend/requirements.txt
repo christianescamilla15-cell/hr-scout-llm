@@ -22,3 +22,6 @@ itsdangerous==2.2.0
 python-multipart==0.0.12
 pdfplumber==0.11.4
 python-docx==1.1.2
+
+# Day 6 — billing
+stripe==11.1.1
