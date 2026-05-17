@@ -42,6 +42,11 @@ class Settings(BaseSettings):
 
     allowed_origins: str = "http://localhost:3004,https://hr-scout-llm.vercel.app"
 
+    # Frontend URLs used by Stripe checkout success/cancel + portal return
+    frontend_billing_success_url: str = "http://localhost:3004/dashboard?upgraded=1"
+    frontend_billing_cancel_url: str = "http://localhost:3004/precios"
+    frontend_billing_portal_return_url: str = "http://localhost:3004/dashboard"
+
     @property
     def allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
