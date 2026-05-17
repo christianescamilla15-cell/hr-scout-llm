@@ -15,7 +15,15 @@ PDF/DOCX upload arrives Day 5 — for now `cv_source` is locked to "paste".
 from datetime import UTC, datetime
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,8 +36,11 @@ from app.schemas.candidates import (
     CandidateListResponse,
     CandidateResponse,
 )
+from app.upload.extractor import ExtractionError, extract
 
 router = APIRouter(prefix="/api/candidates", tags=["candidates"])
+
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB per spec §8
 
 
 @router.get("", response_model=CandidateListResponse)
@@ -72,6 +83,70 @@ async def create_candidate(
         cv_text=payload.cv_text,
         cv_source=payload.cv_source,
         filename=payload.filename,
+        pii_encrypted=True,
+    )
+    db.add(candidate)
+    await db.commit()
+    await db.refresh(candidate)
+    return CandidateResponse.from_orm_candidate(candidate)
+
+
+@router.post(
+    "/upload",
+    response_model=CandidateResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_candidate(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upload a CV file (PDF or DOCX). Extracts text + heuristic PII.
+
+    Per spec §4 we NEVER persist the original file — we only keep the
+    extracted text plus optionally a name + email (both Fernet-encrypted).
+    The bytes are released as soon as extract() returns.
+    """
+    raw = await file.read()
+    if len(raw) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Empty file",
+        )
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File exceeds 10 MB limit (got {len(raw) / 1024 / 1024:.1f} MB)",
+        )
+
+    try:
+        extracted = extract(raw, file.filename or "", file.content_type)
+    except ExtractionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    # Validate length against the same window the JSON path enforces (50 - 200k).
+    if len(extracted.text) < 50:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Extracted text is suspiciously short (< 50 chars). "
+                   "The file may be a scanned image — try DOCX or pasted text.",
+        )
+    if len(extracted.text) > 200_000:
+        # truncate rather than reject — long CVs are valid, but the LLM has a context budget
+        extracted_text = extracted.text[:200_000]
+    else:
+        extracted_text = extracted.text
+
+    candidate = Candidate(
+        user_id=user.id,
+        full_name=encrypt_pii(extracted.full_name),
+        email=encrypt_pii(extracted.email),
+        cv_text=extracted_text,
+        cv_source=extracted.source,
+        filename=file.filename[:512] if file.filename else None,
         pii_encrypted=True,
     )
     db.add(candidate)
