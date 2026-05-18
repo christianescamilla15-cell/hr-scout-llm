@@ -1,0 +1,189 @@
+# HRScout local staging — full stack in one command.
+#
+# Quick start:
+#   cp docker.env.example docker.env
+#   docker compose --env-file docker.env up backend postgres frontend
+#
+# Profiles let you spin up optional services on demand:
+#   docker compose --profile sonar up      # +sonarqube + sonar-scanner one-shot
+#   docker compose --profile loadtest up   # +locust UI on :8089
+#   docker compose --profile seed up seed  # one-shot: populate DB with demo data
+#
+# DB persists in the named volume `hrscout_pg_data`. Drop with:
+#   docker compose down -v
+#
+# Source of truth: docs/STAGING.md
+
+name: hrscout
+
+services:
+  # ────────────────────────────────────────────────── Postgres
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-hrscout}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hrscout_dev_only}
+      POSTGRES_DB: ${POSTGRES_DB:-hrscout}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"   # 5433 outside to avoid clashing with local pg
+    volumes:
+      - hrscout_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hrscout} -d ${POSTGRES_DB:-hrscout}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ────────────────────────────────────────────────── Backend (FastAPI)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-hrscout}:${POSTGRES_PASSWORD:-hrscout_dev_only}@postgres:5432/${POSTGRES_DB:-hrscout}
+      ENVIRONMENT: development
+      LOG_LEVEL: INFO
+      JWT_SECRET: ${JWT_SECRET:-docker-dev-only-not-secure-3a7f9c2e8d1b5a4f}
+      FERNET_KEY: ${FERNET_KEY:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      OAUTH_REDIRECT_URI: http://localhost:8004/api/auth/google/callback
+      FRONTEND_POST_LOGIN_URL: http://localhost:3004/dashboard
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ALLOWED_ORIGINS: "http://localhost:3004,http://localhost:5173"
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+    ports:
+      - "${BACKEND_PORT:-8004}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      # Mount source for hot reload — overrides the COPY in the Dockerfile
+      - ./backend/app:/app/app
+      - ./backend/alembic:/app/alembic
+      - ./backend/alembic.ini:/app/alembic.ini
+    command: >
+      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health',timeout=3).status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ────────────────────────────────────────────────── Frontend (Vite dev)
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend.Dockerfile
+    environment:
+      VITE_API_URL: http://localhost:8004
+    ports:
+      - "${FRONTEND_PORT:-3004}:5173"
+    volumes:
+      - ./src:/app/src
+      - ./public:/app/public
+      - ./index.html:/app/index.html
+      - ./vite.config.js:/app/vite.config.js
+    command: npm run dev -- --host 0.0.0.0 --port 5173
+    depends_on:
+      - backend
+
+  # ────────────────────────────────────────────────── Seed demo data (one-shot)
+  seed:
+    profiles: ["seed"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-hrscout}:${POSTGRES_PASSWORD:-hrscout_dev_only}@postgres:5432/${POSTGRES_DB:-hrscout}
+      ENVIRONMENT: development
+      JWT_SECRET: ${JWT_SECRET:-docker-dev-only-not-secure-3a7f9c2e8d1b5a4f}
+      FERNET_KEY: ${FERNET_KEY:-}
+    depends_on:
+      backend:
+        condition: service_healthy
+    command: python scripts/seed_demo.py
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/scripts:/app/scripts
+
+  # ────────────────────────────────────────────────── SonarQube (community)
+  sonarqube:
+    profiles: ["sonar"]
+    image: sonarqube:community
+    ports:
+      - "9000:9000"
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://sonar-db:5432/sonar
+      SONAR_JDBC_USERNAME: sonar
+      SONAR_JDBC_PASSWORD: sonar
+    depends_on:
+      sonar-db:
+        condition: service_healthy
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data
+      - sonarqube_logs:/opt/sonarqube/logs
+      - sonarqube_extensions:/opt/sonarqube/extensions
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:9000/api/system/status || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # SonarQube needs its OWN Postgres (separate from app DB)
+  sonar-db:
+    profiles: ["sonar"]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sonar
+      POSTGRES_PASSWORD: sonar
+      POSTGRES_DB: sonar
+    volumes:
+      - sonar_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sonar"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot scanner that points at the running SonarQube
+  sonar-scanner:
+    profiles: ["sonar-scan"]
+    image: sonarsource/sonar-scanner-cli:latest
+    environment:
+      SONAR_HOST_URL: http://sonarqube:9000
+      SONAR_LOGIN: ${SONAR_TOKEN:-}
+    volumes:
+      - .:/usr/src
+    working_dir: /usr/src
+    command: sonar-scanner -Dsonar.projectKey=hrscout
+    depends_on:
+      sonarqube:
+        condition: service_healthy
+
+  # ────────────────────────────────────────────────── Locust (load testing)
+  locust:
+    profiles: ["loadtest"]
+    image: locustio/locust:latest
+    ports:
+      - "8089:8089"   # web UI
+    volumes:
+      - ./loadtest:/mnt/locust
+    command: >
+      -f /mnt/locust/locustfile.py
+      --host http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  hrscout_pg_data:
+  sonarqube_data:
+  sonarqube_logs:
+  sonarqube_extensions:
+  sonar_db_data:

@@ -82,3 +82,7 @@ hrscout_*.db
 .netlify/
 .firebase/
 .serverless/
+
+# Docker local staging (named without leading dot to avoid secret hooks)
+docker.env
+docker.env.local
